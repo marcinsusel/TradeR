@@ -207,6 +207,15 @@ export function AppProvider({ children }) {
     }
   };
 
+  const updateTransactions = async (updatedTxns) => {
+    setTransactions(updatedTxns);
+    saveLocally(updatedTxns, inventoryMethod);
+
+    if (accessToken && gdriveFileId) {
+      await uploadToDrive(updatedTxns, inventoryMethod);
+    }
+  };
+
   // 5. Derived values
   const computedData = useMemo(() => {
     return computeTrades(transactions, inventoryMethod);
@@ -235,6 +244,7 @@ export function AppProvider({ children }) {
     // Mutators
     importTransactions,
     deleteTransaction,
+    updateTransactions,
     clearDatabase
   };
 

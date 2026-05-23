@@ -1,10 +1,11 @@
-import React, { useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { TrendingUp, TrendingDown, DollarSign, Award, Layers, HelpCircle } from 'lucide-react';
+import { TrendingUp, TrendingDown, DollarSign, Award, Layers, HelpCircle, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react';
 
 export default function Dashboard() {
   const { trades, openPositions } = useApp();
+  const [sortConfig, setSortConfig] = useState({ key: 'pnl', direction: 'desc' });
 
   const metrics = useMemo(() => {
     let totalPnL = 0;
@@ -81,6 +82,45 @@ export default function Dashboard() {
     
     return { winners, losers };
   }, [trades]);
+
+  // Aggregate PnL by ticker
+  const pnlByTicker = useMemo(() => {
+    const stats = {};
+    trades.forEach(t => {
+      stats[t.symbol] = (stats[t.symbol] || 0) + t.realizedPnL;
+    });
+    return Object.entries(stats).map(([symbol, pnl]) => ({ symbol, pnl }));
+  }, [trades]);
+
+  // Sort PnL by ticker data
+  const sortedPnlByTicker = useMemo(() => {
+    const data = [...pnlByTicker];
+    if (!sortConfig) return data;
+    const { key, direction } = sortConfig;
+    
+    data.sort((a, b) => {
+      let valA = a[key];
+      let valB = b[key];
+      
+      let comparison = 0;
+      if (typeof valA === 'number' && typeof valB === 'number') {
+        comparison = valA - valB;
+      } else {
+        comparison = String(valA).localeCompare(String(valB), undefined, { numeric: true, sensitivity: 'base' });
+      }
+      return direction === 'asc' ? comparison : -comparison;
+    });
+    return data;
+  }, [pnlByTicker, sortConfig]);
+
+  const requestSort = (key) => {
+    setSortConfig(prev => {
+      if (prev && prev.key === key) {
+        return { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' };
+      }
+      return { key, direction: 'desc' };
+    });
+  };
 
   const formatCurrency = (val) => {
     return new Intl.NumberFormat('en-US', {
@@ -279,35 +319,51 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Open Positions Summary */}
+      {/* PnL by Ticker */}
       <div className="glass-panel" style={{ padding: '1.5rem' }}>
-        <h3 style={{ marginBottom: '1rem' }}>Open Positions ({openPositions.length})</h3>
-        {openPositions.length > 0 ? (
+        <h3 style={{ marginBottom: '1rem' }}>PnL by Ticker</h3>
+        {sortedPnlByTicker.length > 0 ? (
           <div className="table-container">
             <table>
               <thead>
                 <tr>
-                  <th>Ticker</th>
-                  <th>Direction</th>
-                  <th>Open Date</th>
-                  <th>Open Qty</th>
-                  <th>Avg Price</th>
-                  <th>Cost Basis</th>
+                  <th 
+                    className="sortable" 
+                    onClick={() => requestSort('symbol')}
+                    style={{ padding: '1rem' }}
+                  >
+                    Ticker
+                    <span className="sort-icon">
+                      {sortConfig?.key === 'symbol' ? (
+                        sortConfig.direction === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />
+                      ) : (
+                        <ArrowUpDown size={14} style={{ opacity: 0.3 }} />
+                      )}
+                    </span>
+                  </th>
+                  <th 
+                    className="sortable" 
+                    onClick={() => requestSort('pnl')}
+                    style={{ padding: '1rem' }}
+                  >
+                    Realized PnL
+                    <span className="sort-icon">
+                      {sortConfig?.key === 'pnl' ? (
+                        sortConfig.direction === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />
+                      ) : (
+                        <ArrowUpDown size={14} style={{ opacity: 0.3 }} />
+                      )}
+                    </span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {openPositions.map((pos, idx) => (
-                  <tr key={`${pos.symbol}-${idx}`}>
-                    <td style={{ fontWeight: '600' }}>{pos.symbol}</td>
-                    <td>
-                      <span className={`badge ${pos.type === 'LONG' ? 'badge-success' : 'badge-danger'}`}>
-                        {pos.type}
-                      </span>
+                {sortedPnlByTicker.map((row) => (
+                  <tr key={row.symbol}>
+                    <td style={{ fontWeight: '600', padding: '1rem' }}>{row.symbol}</td>
+                    <td style={{ fontWeight: '600', padding: '1rem' }} className={row.pnl >= 0 ? 'gain-text' : 'loss-text'}>
+                      {row.pnl >= 0 ? '+' : ''}{formatCurrency(row.pnl)}
                     </td>
-                    <td>{pos.openDate}</td>
-                    <td>{pos.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
-                    <td>{formatCurrency(pos.openPrice)}</td>
-                    <td style={{ fontWeight: '500' }}>{formatCurrency(pos.costBasis)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -315,7 +371,7 @@ export default function Dashboard() {
           </div>
         ) : (
           <div style={{ textAlign: 'center', padding: '2rem 0', color: 'var(--text-muted)' }}>
-            No open positions. All trades are fully closed.
+            No completed trades found.
           </div>
         )}
       </div>

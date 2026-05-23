@@ -127,7 +127,7 @@ export default function Importer() {
         id: fingerprint,
         ...tempTxn
       };
-    }).filter(t => t.date && t.symbol && t.quantity > 0 && t.price > 0);
+    }).filter(t => t.date && t.symbol && t.quantity > 0 && t.price >= 0);
   };
 
   const setupReview = (generatedTxns) => {

@@ -46,6 +46,8 @@ export function standardizeTransactions(rawTransactions) {
         price,
         fees: Math.abs(commission),
         netAmount,
+        linkedOptionTxnId: t.linkedOptionTxnId,
+        assignedToStockTxnId: t.assignedToStockTxnId,
         originalRow: t
       };
     });
@@ -60,8 +62,53 @@ export function standardizeTransactions(rawTransactions) {
  *   openPositions: Array of open positions (unrealized lots)
  * }
  */
+/**
+ * Helper to determine if a symbol represents an option contract.
+ * Option tickers contain exactly two substrings separated by whitespace.
+ */
+export function isOptionTicker(symbol) {
+  if (!symbol) return false;
+  return symbol.trim().split(/\s+/).length === 2;
+}
+
+/**
+ * Helper to derive expiration date from an option symbol.
+ * Option symbol format (second word) starts with YYMMDD.
+ * Converts YYMMDD to 20YY-MM-DD.
+ */
+export function deriveExpirationDate(symbol) {
+  if (!symbol) return '';
+  const parts = symbol.trim().split(/\s+/);
+  if (parts.length !== 2) return '';
+  const optionPart = parts[1];
+  if (optionPart.length < 6) return '';
+  const yymmdd = optionPart.substring(0, 6);
+  if (/^\d{6}$/.test(yymmdd)) {
+    const yy = yymmdd.substring(0, 2);
+    const mm = yymmdd.substring(2, 4);
+    const dd = yymmdd.substring(4, 6);
+    return `20${yy}-${mm}-${dd}`;
+  }
+  return '';
+}
+
+/**
+ * Pairs BUY and SELL transactions chronologically using FIFO.
+ * Supports both standard Long trades (BUY then SELL) and Short trades (SELL then BUY).
+ * 
+ * Returns: {
+ *   trades: Array of matched trades (realized),
+ *   openPositions: Array of open positions (unrealized lots)
+ * }
+ */
 export function computeTrades(transactions, method = 'FIFO') {
   const stdTxns = standardizeTransactions(transactions);
+  
+  // Build a map of standardized transactions for fast ID lookup
+  const txnsById = {};
+  stdTxns.forEach(t => {
+    txnsById[t.id] = t;
+  });
   
   // Group by symbol
   const groups = {};
@@ -76,6 +123,8 @@ export function computeTrades(transactions, method = 'FIFO') {
   // Process each ticker separately
   Object.keys(groups).forEach(symbol => {
     const symbolTxns = groups[symbol];
+    const isOption = isOptionTicker(symbol);
+    const multiplier = isOption ? 100 : 1;
     
     // Sort chronologically. 
     // To maintain stable sorting for trades on the same day, we keep their index
@@ -91,9 +140,15 @@ export function computeTrades(transactions, method = 'FIFO') {
       return a.id.localeCompare(b.id);
     });
 
-    const openLots = []; // Queue of unmatched lots: { date, price, quantity, fees, initialQuantity, type, id }
+    const openLots = []; // Queue of unmatched lots: { date, price, quantity, fees, initialQuantity, type, id, linkedOptionTxnId }
 
     symbolTxns.forEach(txn => {
+      // If this is an option transaction and it was assigned to a stock,
+      // it is closed. It should not open any option lots or match against option closes.
+      if (isOption && txn.assignedToStockTxnId) {
+        return;
+      }
+
       if (openLots.length === 0) {
         // No open position, this opens a new lot (could be long or short)
         openLots.push({
@@ -103,7 +158,8 @@ export function computeTrades(transactions, method = 'FIFO') {
           quantity: txn.quantity,
           initialQuantity: txn.quantity,
           fees: txn.fees,
-          type: txn.type // 'BUY' (long) or 'SELL' (short)
+          type: txn.type, // 'BUY' (long) or 'SELL' (short)
+          linkedOptionTxnId: txn.linkedOptionTxnId
         });
         return;
       }
@@ -119,7 +175,8 @@ export function computeTrades(transactions, method = 'FIFO') {
           quantity: txn.quantity,
           initialQuantity: txn.quantity,
           fees: txn.fees,
-          type: txn.type
+          type: txn.type,
+          linkedOptionTxnId: txn.linkedOptionTxnId
         });
       } else {
         // Opposite direction (closing transaction). Match against open lots.
@@ -141,12 +198,23 @@ export function computeTrades(transactions, method = 'FIFO') {
 
           if (lot.type === 'BUY') {
             // Long trade: Opened by BUY (lot), closed by SELL (txn)
-            costBasis = matchQty * lot.price + proportionalLotFees;
-            proceeds = matchQty * txn.price - proportionalTxnFees;
+            costBasis = matchQty * multiplier * lot.price + proportionalLotFees;
+            proceeds = matchQty * multiplier * txn.price - proportionalTxnFees;
           } else {
             // Short trade: Opened by SELL (lot), closed by BUY (txn)
-            proceeds = matchQty * lot.price - proportionalLotFees;
-            costBasis = matchQty * txn.price + proportionalTxnFees;
+            proceeds = matchQty * multiplier * lot.price - proportionalLotFees;
+            costBasis = matchQty * multiplier * txn.price + proportionalTxnFees;
+          }
+
+          const standardBasis = costBasis;
+          let optProceeds = 0;
+          if (lot.linkedOptionTxnId && txnsById[lot.linkedOptionTxnId]) {
+            const optionTxn = txnsById[lot.linkedOptionTxnId];
+            const totalOptProceeds = optionTxn.type === 'SELL'
+              ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
+              : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
+            optProceeds = (matchQty / lot.initialQuantity) * totalOptProceeds;
+            costBasis -= optProceeds;
           }
 
           const realizedPnL = proceeds - costBasis;
@@ -172,7 +240,9 @@ export function computeTrades(transactions, method = 'FIFO') {
             realizedPnL,
             holdingPeriod,
             openTxnId: lot.id,
-            closeTxnId: txn.id
+            closeTxnId: txn.id,
+            linkedOptionTxnId: lot.linkedOptionTxnId,
+            standardBasis: standardBasis
           });
 
           // Update remaining quantities
@@ -193,7 +263,8 @@ export function computeTrades(transactions, method = 'FIFO') {
             quantity: qtyRemaining,
             initialQuantity: txn.quantity, // reference to original txn qty for fee calculation
             fees: txn.fees,
-            type: txn.type
+            type: txn.type,
+            linkedOptionTxnId: txn.linkedOptionTxnId
           });
         }
       }
@@ -201,14 +272,51 @@ export function computeTrades(transactions, method = 'FIFO') {
 
     // Any remaining open lots represent current open positions
     openLots.forEach(lot => {
+      let costBasis;
+      const proportionalFees = lot.initialQuantity > 0 ? (lot.quantity / lot.initialQuantity) * lot.fees : 0;
+      if (isOption) {
+        if (lot.type === 'BUY') {
+          costBasis = lot.quantity * 100 * lot.price + proportionalFees;
+        } else {
+          costBasis = lot.quantity * 100 * lot.price - proportionalFees;
+        }
+      } else {
+        costBasis = lot.quantity * lot.price + proportionalFees;
+      }
+
+      // If stock lot has linked option assignment, reduce its cost basis
+      let linkedOption = null;
+      let standardBasis = costBasis;
+      if (!isOption && lot.linkedOptionTxnId && txnsById[lot.linkedOptionTxnId]) {
+        const optionTxn = txnsById[lot.linkedOptionTxnId];
+        const totalOptProceeds = optionTxn.type === 'SELL'
+          ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
+          : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
+        const proportionalOptProceeds = (lot.quantity / lot.initialQuantity) * totalOptProceeds;
+        costBasis = standardBasis - proportionalOptProceeds;
+        
+        linkedOption = {
+          id: optionTxn.id,
+          date: optionTxn.date,
+          symbol: optionTxn.symbol,
+          type: optionTxn.type,
+          quantity: optionTxn.quantity,
+          price: optionTxn.price,
+          fees: optionTxn.fees,
+          proceeds: proportionalOptProceeds // proportional proceeds for this open lot
+        };
+      }
+
       allOpenPositions.push({
         symbol: symbol,
         type: lot.type === 'BUY' ? 'LONG' : 'SHORT',
         quantity: lot.quantity,
         openPrice: lot.price,
         openDate: lot.date,
-        costBasis: lot.quantity * lot.price + (lot.quantity / lot.initialQuantity) * lot.fees,
-        lotId: lot.id
+        costBasis: costBasis,
+        standardBasis: standardBasis,
+        lotId: lot.id,
+        linkedOption: linkedOption
       });
     });
   });
