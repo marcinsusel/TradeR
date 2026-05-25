@@ -77,6 +77,7 @@ export default function Importer() {
   // Generate standardized transaction structures from mappings
   const generateTransactions = (rows, headerIdx, currentMappings) => {
     const dataRows = rows.slice(headerIdx + 1);
+    const fingerprintCounts = {};
     
     return dataRows.map((row, index) => {
       // Extract mapped columns
@@ -121,10 +122,19 @@ export default function Importer() {
       };
 
       // Generate stable fingerprint hash
-      const fingerprint = computeFingerprint(tempTxn);
+      const baseFingerprint = computeFingerprint(tempTxn);
+      
+      if (fingerprintCounts[baseFingerprint] === undefined) {
+        fingerprintCounts[baseFingerprint] = 0;
+      } else {
+        fingerprintCounts[baseFingerprint] += 1;
+      }
+      
+      const count = fingerprintCounts[baseFingerprint];
+      const uniqueId = count === 0 ? baseFingerprint : `${baseFingerprint}-${count}`;
 
       return {
-        id: fingerprint,
+        id: uniqueId,
         ...tempTxn
       };
     }).filter(t => t.date && t.symbol && t.quantity > 0 && t.price >= 0);

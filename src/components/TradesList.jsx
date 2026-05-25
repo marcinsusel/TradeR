@@ -63,8 +63,8 @@ export default function TradesList() {
 
   // Assignment Modal state
   const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
-  const [assignModalSelectedOptionId, setAssignModalSelectedOptionId] = useState('');
-  const [assignModalSelectedStockId, setAssignModalSelectedStockId] = useState('');
+  const [assignModalSelectedOptionIds, setAssignModalSelectedOptionIds] = useState(new Set());
+  const [assignModalSelectedStockIds, setAssignModalSelectedStockIds] = useState(new Set());
 
   const toggleExpandSymbol = (symbol) => {
     setExpandedSymbols(prev => {
@@ -91,9 +91,33 @@ export default function TradesList() {
   };
 
   const handleOpenAssignModal = () => {
-    setAssignModalSelectedOptionId('');
-    setAssignModalSelectedStockId('');
+    setAssignModalSelectedOptionIds(new Set());
+    setAssignModalSelectedStockIds(new Set());
     setIsAssignModalOpen(true);
+  };
+
+  const handleToggleOptionSelection = (lotId) => {
+    setAssignModalSelectedOptionIds(prev => {
+      const next = new Set(prev);
+      if (next.has(lotId)) {
+        next.delete(lotId);
+      } else {
+        next.add(lotId);
+      }
+      return next;
+    });
+  };
+
+  const handleToggleStockSelection = (lotId) => {
+    setAssignModalSelectedStockIds(prev => {
+      const next = new Set(prev);
+      if (next.has(lotId)) {
+        next.delete(lotId);
+      } else {
+        next.add(lotId);
+      }
+      return next;
+    });
   };
 
   const handleTabChange = (tabName) => {
@@ -169,22 +193,36 @@ export default function TradesList() {
   };
 
   const handleConfirmAssignment = async () => {
-    if (!assignModalSelectedOptionId || !assignModalSelectedStockId) {
-      alert("Please select exactly one option lot and one stock lot to link.");
+    if (assignModalSelectedOptionIds.size === 0 || assignModalSelectedStockIds.size === 0) {
+      alert("Please select at least one option lot and one stock lot to link.");
       return;
     }
 
+    // Determine if we should keep the window open (at least one unchecked on option side and stock side)
+    const modalOptionLots = openPositions.filter(p => selectedSymbols.has(p.symbol) && isOptionTicker(p.symbol));
+    const modalStockLots = openPositions.filter(p => selectedSymbols.has(p.symbol) && !isOptionTicker(p.symbol) && !p.linkedOptions);
+
+    const hasUncheckedOption = modalOptionLots.length > assignModalSelectedOptionIds.size;
+    const hasUncheckedStock = modalStockLots.length > assignModalSelectedStockIds.size;
+    const keepOpen = hasUncheckedOption && hasUncheckedStock;
+
     const updated = transactions.map(t => {
-      if (t.id === assignModalSelectedOptionId) {
+      if (assignModalSelectedOptionIds.has(t.id)) {
+        const existingStockIds = t.assignedToStockTxnId ? t.assignedToStockTxnId.split(',') : [];
+        const newStockIds = [...assignModalSelectedStockIds];
+        const combinedStockIds = Array.from(new Set([...existingStockIds, ...newStockIds])).filter(Boolean).join(',');
         return {
           ...t,
-          assignedToStockTxnId: assignModalSelectedStockId
+          assignedToStockTxnId: combinedStockIds
         };
       }
-      if (t.id === assignModalSelectedStockId) {
+      if (assignModalSelectedStockIds.has(t.id)) {
+        const existingOptIds = t.linkedOptionTxnId ? t.linkedOptionTxnId.split(',') : [];
+        const newOptIds = [...assignModalSelectedOptionIds];
+        const combinedOptIds = Array.from(new Set([...existingOptIds, ...newOptIds])).filter(Boolean).join(',');
         return {
           ...t,
-          linkedOptionTxnId: assignModalSelectedOptionId
+          linkedOptionTxnId: combinedOptIds
         };
       }
       return t;
@@ -192,8 +230,15 @@ export default function TradesList() {
 
     try {
       await updateTransactions(updated);
-      setIsAssignModalOpen(false);
-      setSelectedSymbols(new Set());
+      
+      if (keepOpen) {
+        // Clear selection to prepare for the next round
+        setAssignModalSelectedOptionIds(new Set());
+        setAssignModalSelectedStockIds(new Set());
+      } else {
+        setIsAssignModalOpen(false);
+        setSelectedSymbols(new Set());
+      }
     } catch (err) {
       console.error(err);
       alert("Failed to save assignment link: " + err.message);
@@ -205,14 +250,28 @@ export default function TradesList() {
       return;
     }
     const updated = transactions.map(t => {
-      if (t.id === stockTxnId) {
+      if (t.id === stockTxnId && t.linkedOptionTxnId) {
+        const nextOptIds = t.linkedOptionTxnId.split(',')
+          .filter(id => id !== optionTxnId)
+          .join(',');
         const next = { ...t };
-        delete next.linkedOptionTxnId;
+        if (nextOptIds) {
+          next.linkedOptionTxnId = nextOptIds;
+        } else {
+          delete next.linkedOptionTxnId;
+        }
         return next;
       }
-      if (t.id === optionTxnId) {
+      if (t.id === optionTxnId && t.assignedToStockTxnId) {
+        const nextStockIds = t.assignedToStockTxnId.split(',')
+          .filter(id => id !== stockTxnId)
+          .join(',');
         const next = { ...t };
-        delete next.assignedToStockTxnId;
+        if (nextStockIds) {
+          next.assignedToStockTxnId = nextStockIds;
+        } else {
+          delete next.assignedToStockTxnId;
+        }
         return next;
       }
       return t;
@@ -754,7 +813,7 @@ export default function TradesList() {
                                       </thead>
                                       <tbody>
                                         {sortedLots.map((lot) => {
-                                          const hasLink = !!lot.linkedOption;
+                                          const hasLink = !!lot.linkedOptions && lot.linkedOptions.length > 0;
                                           const isLotExpanded = expandedLotIds.has(lot.lotId);
 
                                           return (
@@ -784,7 +843,7 @@ export default function TradesList() {
                                                 <td>
                                                   {hasLink ? (
                                                     <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
-                                                      Linked ({lot.linkedOption.symbol})
+                                                      Linked ({lot.linkedOptions.map(o => o.symbol.split(' ')[0]).join(', ')})
                                                     </span>
                                                   ) : (
                                                     <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>None</span>
@@ -792,39 +851,53 @@ export default function TradesList() {
                                                 </td>
                                               </tr>
                                               
-                                              {isLotExpanded && lot.linkedOption && (
+                                              {isLotExpanded && lot.linkedOptions && lot.linkedOptions.length > 0 && (
                                                 <tr>
                                                   <td colSpan={6} style={{ background: 'var(--bg-tertiary)', padding: '1rem' }}>
-                                                    <div style={{
-                                                      borderLeft: '3px solid var(--color-success)',
-                                                      paddingLeft: '1rem',
-                                                      display: 'flex',
-                                                      flexDirection: 'column',
-                                                      gap: '0.75rem'
-                                                    }}>
-                                                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                                        <h5 style={{ margin: 0, color: 'var(--color-success)', fontSize: '0.85rem', fontWeight: '600' }}>
-                                                          Option Assignment Details
-                                                        </h5>
-                                                        <button 
-                                                          className="btn btn-danger" 
-                                                          style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
-                                                          onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleUnlinkAssignment(lot.lotId, lot.linkedOption.id);
-                                                          }}
-                                                        >
-                                                          Unlink Assignment
-                                                        </button>
+                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                                      <h5 style={{ margin: 0, color: 'var(--color-success)', fontSize: '0.85rem', fontWeight: '600' }}>
+                                                        Option Assignment Details ({lot.linkedOptions.length} linked option{lot.linkedOptions.length > 1 ? 's' : ''})
+                                                      </h5>
+                                                      
+                                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                                                        {lot.linkedOptions.map((opt) => (
+                                                          <div key={opt.id} style={{
+                                                            borderLeft: '3px solid var(--color-success)',
+                                                            paddingLeft: '1rem',
+                                                            display: 'flex',
+                                                            flexDirection: 'column',
+                                                            gap: '0.5rem',
+                                                            background: 'rgba(255, 255, 255, 0.01)',
+                                                            padding: '0.75rem',
+                                                            borderRadius: '4px'
+                                                          }}>
+                                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                                              <strong style={{ fontSize: '0.85rem', color: 'var(--text-primary)' }}>{opt.symbol}</strong>
+                                                              <button 
+                                                                className="btn btn-danger" 
+                                                                style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
+                                                                onClick={(e) => {
+                                                                  e.stopPropagation();
+                                                                  handleUnlinkAssignment(lot.lotId, opt.id);
+                                                                }}
+                                                              >
+                                                                Unlink Assignment
+                                                              </button>
+                                                            </div>
+                                                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '0.5rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                                                              <div>Opening Date: <strong>{opt.date}</strong></div>
+                                                              <div>Contracts: <strong>{opt.quantity}</strong></div>
+                                                              <div>Premium Price: <strong>{formatCurrency(opt.price)}</strong></div>
+                                                              <div>Option Fees: <strong>{formatCurrency(opt.fees)}</strong></div>
+                                                              <div>Proceeds Rollover: <strong className="gain-text">-{formatCurrency(opt.proceeds)}</strong></div>
+                                                            </div>
+                                                          </div>
+                                                        ))}
                                                       </div>
-                                                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '0.75rem', fontSize: '0.8rem' }}>
-                                                        <div>Option Ticker: <strong>{lot.linkedOption.symbol}</strong></div>
-                                                        <div>Opening Date: <strong>{lot.linkedOption.date}</strong></div>
-                                                        <div>Contracts: <strong>{lot.linkedOption.quantity}</strong></div>
-                                                        <div>Premium Price: <strong>{formatCurrency(lot.linkedOption.price)}</strong></div>
-                                                        <div>Option Fees: <strong>{formatCurrency(lot.linkedOption.fees)}</strong></div>
-                                                        <div>Proceeds Rollover: <strong className="gain-text">-{formatCurrency(lot.linkedOption.proceeds)}</strong></div>
+                                                      
+                                                      <div style={{ display: 'flex', gap: '1.5rem', borderTop: '1px solid var(--border-color)', paddingTop: '0.75rem', fontSize: '0.85rem' }}>
                                                         <div>Standard Cost Basis: <strong>{formatCurrency(lot.standardBasis)}</strong></div>
+                                                        <div>Total Rollover reduction: <strong className="gain-text">-{formatCurrency(lot.standardBasis - lot.costBasis)}</strong></div>
                                                         <div>Adjusted Cost Basis: <strong className="gain-text">{formatCurrency(lot.costBasis)}</strong></div>
                                                       </div>
                                                     </div>
@@ -1088,14 +1161,14 @@ export default function TradesList() {
             </div>
             <div className="modal-body">
               <p style={{ marginBottom: '1.25rem', color: 'var(--text-secondary)' }}>
-                Select exactly one open option lot and one open stock lot to link them. The option proceeds will reduce the stock lot's cost basis.
+                Select option lots and stock lots to link them. The option proceeds will reduce the cost basis of the linked stock positions.
               </p>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', minHeight: '200px' }}>
                 {/* Options Column */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                   <h4 style={{ fontSize: '1rem', color: 'var(--color-primary)', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>
-                    1. Select Option Lot
+                    1. Select Option Lots
                   </h4>
                   {openPositions.filter(p => selectedSymbols.has(p.symbol) && isOptionTicker(p.symbol)).length > 0 ? (
                     <div className="table-container" style={{ maxHeight: '250px', overflowY: 'auto' }}>
@@ -1112,27 +1185,29 @@ export default function TradesList() {
                         <tbody>
                           {openPositions
                             .filter(p => selectedSymbols.has(p.symbol) && isOptionTicker(p.symbol))
-                            .map((lot) => (
-                              <tr 
-                                key={lot.lotId} 
-                                style={{ cursor: 'pointer', background: assignModalSelectedOptionId === lot.lotId ? 'rgba(99, 102, 241, 0.1)' : 'transparent' }}
-                                onClick={() => setAssignModalSelectedOptionId(lot.lotId)}
-                              >
-                                <td style={{ textAlign: 'center' }}>
-                                  <input 
-                                    type="radio" 
-                                    name="assignOptionLot"
-                                    checked={assignModalSelectedOptionId === lot.lotId}
-                                    onChange={() => setAssignModalSelectedOptionId(lot.lotId)}
-                                    onClick={(e) => e.stopPropagation()}
-                                  />
-                                </td>
-                                <td style={{ fontSize: '0.8rem' }}>{lot.openDate}</td>
-                                <td style={{ fontWeight: '600' }}>{lot.symbol}</td>
-                                <td>{lot.quantity}</td>
-                                <td>{formatCurrency(lot.openPrice)}</td>
-                              </tr>
-                            ))}
+                            .map((lot) => {
+                              const isSel = assignModalSelectedOptionIds.has(lot.lotId);
+                              return (
+                                <tr 
+                                  key={lot.lotId} 
+                                  style={{ cursor: 'pointer', background: isSel ? 'rgba(99, 102, 241, 0.1)' : 'transparent' }}
+                                  onClick={() => handleToggleOptionSelection(lot.lotId)}
+                                >
+                                  <td style={{ textAlign: 'center' }}>
+                                    <input 
+                                      type="checkbox" 
+                                      checked={isSel}
+                                      onChange={() => handleToggleOptionSelection(lot.lotId)}
+                                      onClick={(e) => e.stopPropagation()}
+                                    />
+                                  </td>
+                                  <td style={{ fontSize: '0.8rem' }}>{lot.openDate}</td>
+                                  <td style={{ fontWeight: '600' }}>{lot.symbol}</td>
+                                  <td>{lot.quantity}</td>
+                                  <td>{formatCurrency(lot.openPrice)}</td>
+                                </tr>
+                              );
+                            })}
                         </tbody>
                       </table>
                     </div>
@@ -1146,9 +1221,9 @@ export default function TradesList() {
                 {/* Stocks Column */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                   <h4 style={{ fontSize: '1rem', color: 'var(--color-secondary)', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>
-                    2. Select Stock Lot
+                    2. Select Stock Lots
                   </h4>
-                  {openPositions.filter(p => selectedSymbols.has(p.symbol) && !isOptionTicker(p.symbol)).length > 0 ? (
+                  {openPositions.filter(p => selectedSymbols.has(p.symbol) && !isOptionTicker(p.symbol) && !p.linkedOptions).length > 0 ? (
                     <div className="table-container" style={{ maxHeight: '250px', overflowY: 'auto' }}>
                       <table>
                         <thead>
@@ -1162,28 +1237,30 @@ export default function TradesList() {
                         </thead>
                         <tbody>
                           {openPositions
-                            .filter(p => selectedSymbols.has(p.symbol) && !isOptionTicker(p.symbol))
-                            .map((lot) => (
-                              <tr 
-                                key={lot.lotId} 
-                                style={{ cursor: 'pointer', background: assignModalSelectedStockId === lot.lotId ? 'rgba(6, 182, 212, 0.1)' : 'transparent' }}
-                                onClick={() => setAssignModalSelectedStockId(lot.lotId)}
-                              >
-                                <td style={{ textAlign: 'center' }}>
-                                  <input 
-                                    type="radio" 
-                                    name="assignStockLot"
-                                    checked={assignModalSelectedStockId === lot.lotId}
-                                    onChange={() => setAssignModalSelectedStockId(lot.lotId)}
-                                    onClick={(e) => e.stopPropagation()}
-                                  />
-                                </td>
-                                <td style={{ fontSize: '0.8rem' }}>{lot.openDate}</td>
-                                <td style={{ fontWeight: '600' }}>{lot.symbol}</td>
-                                <td>{lot.quantity}</td>
-                                <td>{formatCurrency(lot.openPrice)}</td>
-                              </tr>
-                            ))}
+                            .filter(p => selectedSymbols.has(p.symbol) && !isOptionTicker(p.symbol) && !p.linkedOptions)
+                            .map((lot) => {
+                              const isSel = assignModalSelectedStockIds.has(lot.lotId);
+                              return (
+                                <tr 
+                                  key={lot.lotId} 
+                                  style={{ cursor: 'pointer', background: isSel ? 'rgba(6, 182, 212, 0.1)' : 'transparent' }}
+                                  onClick={() => handleToggleStockSelection(lot.lotId)}
+                                >
+                                  <td style={{ textAlign: 'center' }}>
+                                    <input 
+                                      type="checkbox" 
+                                      checked={isSel}
+                                      onChange={() => handleToggleStockSelection(lot.lotId)}
+                                      onClick={(e) => e.stopPropagation()}
+                                    />
+                                  </td>
+                                  <td style={{ fontSize: '0.8rem' }}>{lot.openDate}</td>
+                                  <td style={{ fontWeight: '600' }}>{lot.symbol}</td>
+                                  <td>{lot.quantity}</td>
+                                  <td>{formatCurrency(lot.openPrice)}</td>
+                                </tr>
+                              );
+                            })}
                         </tbody>
                       </table>
                     </div>
@@ -1204,11 +1281,11 @@ export default function TradesList() {
               </button>
               <button 
                 className="btn btn-primary" 
-                disabled={!assignModalSelectedOptionId || !assignModalSelectedStockId}
+                disabled={assignModalSelectedOptionIds.size === 0 || assignModalSelectedStockIds.size === 0}
                 onClick={handleConfirmAssignment}
                 style={{
-                  opacity: (assignModalSelectedOptionId && assignModalSelectedStockId) ? 1 : 0.5,
-                  cursor: (assignModalSelectedOptionId && assignModalSelectedStockId) ? 'pointer' : 'not-allowed',
+                  opacity: (assignModalSelectedOptionIds.size > 0 && assignModalSelectedStockIds.size > 0) ? 1 : 0.5,
+                  cursor: (assignModalSelectedOptionIds.size > 0 && assignModalSelectedStockIds.size > 0) ? 'pointer' : 'not-allowed',
                   background: 'var(--color-primary)'
                 }}
               >

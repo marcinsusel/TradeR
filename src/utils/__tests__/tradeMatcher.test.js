@@ -318,9 +318,10 @@ function runTests() {
     assert.strictEqual(xyzLot.quantity, 50, 'Open XYZ lot should have quantity 50');
     assert.strictEqual(xyzLot.standardBasis, 502.50, 'Open XYZ lot standardBasis check');
     assert.strictEqual(xyzLot.costBasis, 428.00, 'Open XYZ lot costBasis check (502.50 - 74.50)');
-    assert.ok(xyzLot.linkedOption, 'Should have linkedOption details');
-    assert.strictEqual(xyzLot.linkedOption.id, 'XYZ-option-txn', 'Linked option ID check');
-    assert.strictEqual(xyzLot.linkedOption.proceeds, 74.50, 'Linked option proportional proceeds check');
+    assert.ok(xyzLot.linkedOptions, 'Should have linkedOptions details');
+    assert.strictEqual(xyzLot.linkedOptions.length, 1, 'Should have 1 linked option');
+    assert.strictEqual(xyzLot.linkedOptions[0].id, 'XYZ-option-txn', 'Linked option ID check');
+    assert.strictEqual(xyzLot.linkedOptions[0].proceeds, 74.50, 'Linked option proportional proceeds check');
 
     // Assert realized trade basis is adjusted
     const xyzTrades = result.trades.filter(t => t.symbol === 'XYZ');

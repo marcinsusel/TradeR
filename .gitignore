@@ -37,5 +37,6 @@ dist-ssr/
 # Vite cache
 .vite/
 
-# Csv files
+# Private files
+testdata/
 csv/

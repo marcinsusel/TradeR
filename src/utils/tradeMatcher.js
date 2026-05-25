@@ -208,12 +208,25 @@ export function computeTrades(transactions, method = 'FIFO') {
 
           const standardBasis = costBasis;
           let optProceeds = 0;
-          if (lot.linkedOptionTxnId && txnsById[lot.linkedOptionTxnId]) {
-            const optionTxn = txnsById[lot.linkedOptionTxnId];
-            const totalOptProceeds = optionTxn.type === 'SELL'
-              ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
-              : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
-            optProceeds = (matchQty / lot.initialQuantity) * totalOptProceeds;
+          if (lot.linkedOptionTxnId) {
+            const optIds = String(lot.linkedOptionTxnId).split(',').filter(Boolean);
+            optIds.forEach(optId => {
+              if (txnsById[optId]) {
+                const optionTxn = txnsById[optId];
+                const totalOptProceeds = optionTxn.type === 'SELL'
+                  ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
+                  : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
+                
+                const linkedStockTxns = stdTxns.filter(t => t.linkedOptionTxnId && String(t.linkedOptionTxnId).split(',').includes(optId));
+                const totalStockQty = linkedStockTxns.reduce((sum, t) => sum + t.quantity, 0);
+                
+                const proportionalOptProceeds = totalStockQty > 0
+                  ? (matchQty / totalStockQty) * totalOptProceeds
+                  : (matchQty / lot.initialQuantity) * totalOptProceeds;
+                
+                optProceeds += proportionalOptProceeds;
+              }
+            });
             costBasis -= optProceeds;
           }
 
@@ -285,26 +298,46 @@ export function computeTrades(transactions, method = 'FIFO') {
       }
 
       // If stock lot has linked option assignment, reduce its cost basis
-      let linkedOption = null;
+      let linkedOptions = null;
       let standardBasis = costBasis;
-      if (!isOption && lot.linkedOptionTxnId && txnsById[lot.linkedOptionTxnId]) {
-        const optionTxn = txnsById[lot.linkedOptionTxnId];
-        const totalOptProceeds = optionTxn.type === 'SELL'
-          ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
-          : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
-        const proportionalOptProceeds = (lot.quantity / lot.initialQuantity) * totalOptProceeds;
-        costBasis = standardBasis - proportionalOptProceeds;
-        
-        linkedOption = {
-          id: optionTxn.id,
-          date: optionTxn.date,
-          symbol: optionTxn.symbol,
-          type: optionTxn.type,
-          quantity: optionTxn.quantity,
-          price: optionTxn.price,
-          fees: optionTxn.fees,
-          proceeds: proportionalOptProceeds // proportional proceeds for this open lot
-        };
+      if (!isOption && lot.linkedOptionTxnId) {
+        const optIds = String(lot.linkedOptionTxnId).split(',').filter(Boolean);
+        const optionsList = [];
+        let totalOptProceedsForLot = 0;
+
+        optIds.forEach(optId => {
+          if (txnsById[optId]) {
+            const optionTxn = txnsById[optId];
+            const totalOptProceeds = optionTxn.type === 'SELL'
+              ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
+              : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
+            
+            const linkedStockTxns = stdTxns.filter(t => t.linkedOptionTxnId && String(t.linkedOptionTxnId).split(',').includes(optId));
+            const totalStockQty = linkedStockTxns.reduce((sum, t) => sum + t.quantity, 0);
+            
+            const proportionalOptProceeds = totalStockQty > 0
+              ? (lot.quantity / totalStockQty) * totalOptProceeds
+              : (lot.quantity / lot.initialQuantity) * totalOptProceeds;
+            
+            totalOptProceedsForLot += proportionalOptProceeds;
+            
+            optionsList.push({
+              id: optionTxn.id,
+              date: optionTxn.date,
+              symbol: optionTxn.symbol,
+              type: optionTxn.type,
+              quantity: optionTxn.quantity,
+              price: optionTxn.price,
+              fees: optionTxn.fees,
+              proceeds: proportionalOptProceeds
+            });
+          }
+        });
+
+        if (optionsList.length > 0) {
+          costBasis = standardBasis - totalOptProceedsForLot;
+          linkedOptions = optionsList;
+        }
       }
 
       allOpenPositions.push({
@@ -316,7 +349,7 @@ export function computeTrades(transactions, method = 'FIFO') {
         costBasis: costBasis,
         standardBasis: standardBasis,
         lotId: lot.id,
-        linkedOption: linkedOption
+        linkedOptions: linkedOptions
       });
     });
   });

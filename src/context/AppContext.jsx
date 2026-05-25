@@ -8,6 +8,24 @@ export function useApp() {
   return useContext(AppContext);
 }
 
+export function deduplicateDatabaseIds(txns) {
+  if (!Array.isArray(txns)) return [];
+  const seenIds = {};
+  return txns.map((t, idx) => {
+    const baseId = t.id || `txn-${idx}-${t.date}-${t.symbol}-${Math.abs(parseFloat(t.quantity || 0))}`;
+    if (seenIds[baseId] === undefined) {
+      seenIds[baseId] = 0;
+      if (t.id !== baseId) {
+        return { ...t, id: baseId };
+      }
+      return t;
+    } else {
+      seenIds[baseId] += 1;
+      return { ...t, id: `${baseId}-${seenIds[baseId]}` };
+    }
+  });
+}
+
 export function AppProvider({ children }) {
   const [transactions, setTransactions] = useState([]);
   const [inventoryMethod, setInventoryMethod] = useState('FIFO');
@@ -27,7 +45,22 @@ export function AppProvider({ children }) {
     if (localData) {
       try {
         const parsed = JSON.parse(localData);
-        if (parsed.transactions) setTransactions(parsed.transactions);
+        if (parsed.transactions) {
+          const cleaned = deduplicateDatabaseIds(parsed.transactions);
+          setTransactions(cleaned);
+          
+          const rawCleanedStr = JSON.stringify(cleaned);
+          const rawOrigStr = JSON.stringify(parsed.transactions);
+          if (rawCleanedStr !== rawOrigStr) {
+            localStorage.setItem(
+              'trader_local_db',
+              JSON.stringify({
+                transactions: cleaned,
+                settings: parsed.settings || { inventoryMethod }
+              })
+            );
+          }
+        }
         if (parsed.settings?.inventoryMethod) setInventoryMethod(parsed.settings.inventoryMethod);
       } catch (err) {
         console.error('Failed to load local DB', err);
@@ -94,6 +127,7 @@ export function AppProvider({ children }) {
       // Merge local and cloud transactions if there are discrepancies
       // For simplicity, cloud data wins, but we merge unique transactions.
       let mergedTxns = data.transactions || [];
+      mergedTxns = deduplicateDatabaseIds(mergedTxns);
       
       // If we have local transactions that aren't in the cloud (e.g. added while offline), 
       // we can append them. We check by ID.
@@ -102,6 +136,7 @@ export function AppProvider({ children }) {
       
       if (localOnlyTxns.length > 0) {
         mergedTxns = [...mergedTxns, ...localOnlyTxns];
+        mergedTxns = deduplicateDatabaseIds(mergedTxns);
         // Trigger a save to drive to sync them up
         await saveDatabaseToDrive(fileId, {
           transactions: mergedTxns,
