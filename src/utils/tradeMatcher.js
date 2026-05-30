@@ -11,6 +11,7 @@
 export function standardizeTransactions(rawTransactions) {
   return rawTransactions
     .filter(t => {
+      if (t.voided) return false;
       if (!t.symbol || t.symbol === '--' || t.symbol === '-') return false;
       const qty = parseFloat(t.quantity);
       const price = parseFloat(t.price);
@@ -20,14 +21,14 @@ export function standardizeTransactions(rawTransactions) {
       const qty = parseFloat(t.quantity);
       const price = parseFloat(t.price);
       const commission = parseFloat(t.commission) || 0;
-      
+
       // Determine type: negative quantity usually indicates a sell.
       // E.g., IBKR uses negative quantity for Sells.
       // E*TRADE uses negative quantity for Sells.
       // If the CSV explicitly has "Buy" or "Sold" type, we check that too.
       let type = qty < 0 ? 'SELL' : 'BUY';
       const actionType = (t.type || t.activityType || t.transactionType || '').toUpperCase();
-      
+
       if (actionType.includes('SELL') || actionType.includes('SOLD') || actionType.includes('ASSIGN')) {
         type = 'SELL';
       } else if (actionType.includes('BUY') || actionType.includes('BOUGHT')) {
@@ -36,7 +37,7 @@ export function standardizeTransactions(rawTransactions) {
 
       // Proportional net amount
       let netAmount = parseFloat(t.amount || t.netAmount || t.grossAmount) || 0;
-      
+
       return {
         id: t.id || `txn-${index}-${t.date}-${t.symbol}-${Math.abs(qty)}`,
         date: t.date,
@@ -44,7 +45,7 @@ export function standardizeTransactions(rawTransactions) {
         type,
         quantity: Math.abs(qty),
         price,
-        fees: Math.abs(commission),
+        fees: -commission,
         netAmount,
         linkedOptionTxnId: t.linkedOptionTxnId,
         assignedToStockTxnId: t.assignedToStockTxnId,
@@ -68,7 +69,11 @@ export function standardizeTransactions(rawTransactions) {
  */
 export function isOptionTicker(symbol) {
   if (!symbol) return false;
-  return symbol.trim().split(/\s+/).length === 2;
+  let symbolSplit = symbol.trim().split(/\s+/);
+  if (symbolSplit.length === 2 && symbolSplit[1].length === 15) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -103,13 +108,13 @@ export function deriveExpirationDate(symbol) {
  */
 export function computeTrades(transactions, method = 'FIFO') {
   const stdTxns = standardizeTransactions(transactions);
-  
+
   // Build a map of standardized transactions for fast ID lookup
   const txnsById = {};
   stdTxns.forEach(t => {
     txnsById[t.id] = t;
   });
-  
+
   // Group by symbol
   const groups = {};
   stdTxns.forEach(t => {
@@ -125,7 +130,7 @@ export function computeTrades(transactions, method = 'FIFO') {
     const symbolTxns = groups[symbol];
     const isOption = isOptionTicker(symbol);
     const multiplier = isOption ? 100 : 1;
-    
+
     // Sort chronologically. 
     // To maintain stable sorting for trades on the same day, we keep their index
     symbolTxns.sort((a, b) => {
@@ -207,6 +212,8 @@ export function computeTrades(transactions, method = 'FIFO') {
           }
 
           const standardBasis = costBasis;
+
+          // Put assignments: opening stock BUY has linked option premium, subtract from cost basis
           let optProceeds = 0;
           if (lot.linkedOptionTxnId) {
             const optIds = String(lot.linkedOptionTxnId).split(',').filter(Boolean);
@@ -216,22 +223,73 @@ export function computeTrades(transactions, method = 'FIFO') {
                 const totalOptProceeds = optionTxn.type === 'SELL'
                   ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
                   : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
-                
+
                 const linkedStockTxns = stdTxns.filter(t => t.linkedOptionTxnId && String(t.linkedOptionTxnId).split(',').includes(optId));
                 const totalStockQty = linkedStockTxns.reduce((sum, t) => sum + t.quantity, 0);
-                
+
                 const proportionalOptProceeds = totalStockQty > 0
                   ? (matchQty / totalStockQty) * totalOptProceeds
                   : (matchQty / lot.initialQuantity) * totalOptProceeds;
-                
+
                 optProceeds += proportionalOptProceeds;
               }
             });
             costBasis -= optProceeds;
           }
 
-          const realizedPnL = proceeds - costBasis;
-          
+          // Call assignments: closing stock SELL has linked option premium, add to stock proceeds (or subtract cost basis for buy covers)
+          let closeOptProceeds = 0;
+          if (txn.linkedOptionTxnId) {
+            const optIds = String(txn.linkedOptionTxnId).split(',').filter(Boolean);
+            optIds.forEach(optId => {
+              if (txnsById[optId]) {
+                const optionTxn = txnsById[optId];
+                const totalOptProceeds = optionTxn.type === 'SELL'
+                  ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
+                  : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
+
+                const linkedStockTxns = stdTxns.filter(t => t.linkedOptionTxnId && String(t.linkedOptionTxnId).split(',').includes(optId));
+                const totalStockQty = linkedStockTxns.reduce((sum, t) => sum + t.quantity, 0);
+
+                const proportionalOptProceeds = totalStockQty > 0
+                  ? (matchQty / totalStockQty) * totalOptProceeds
+                  : (matchQty / txn.quantity) * totalOptProceeds;
+
+                closeOptProceeds += proportionalOptProceeds;
+              }
+            });
+
+            if (txn.type === 'SELL') {
+              // Increase stock disposition proceeds
+              proceeds += closeOptProceeds;
+            } else if (txn.type === 'BUY') {
+              // Decrease cost basis for short covers
+              costBasis -= closeOptProceeds;
+            }
+          }
+
+          let realizedPnL = proceeds - costBasis;
+          let washSaleAmount = 0;
+
+          const closeTxnOriginal = txnsById[txn.id]?.originalRow;
+          const washSalesMap = closeTxnOriginal?.washSalesMap || {};
+          const specificWashSale = washSalesMap[lot.id];
+
+          if (specificWashSale?.washSale === true || (closeTxnOriginal?.washSale === true && !specificWashSale)) {
+            const customWashSale = specificWashSale 
+              ? parseFloat(specificWashSale.washSaleAmount) 
+              : parseFloat(closeTxnOriginal?.washSaleAmount);
+
+            if (!isNaN(customWashSale) && customWashSale > 0) {
+              washSaleAmount = customWashSale;
+              costBasis = proceeds + washSaleAmount;
+              realizedPnL = 0;
+            } else if (realizedPnL < 0) {
+              washSaleAmount = Math.abs(realizedPnL);
+              realizedPnL = 0;
+            }
+          }
+
           // Determine holding period (short vs long term)
           const openDateObj = new Date(lot.date);
           const closeDateObj = new Date(txn.date);
@@ -251,10 +309,11 @@ export function computeTrades(transactions, method = 'FIFO') {
             costBasis,
             proceeds,
             realizedPnL,
+            washSaleAmount,
             holdingPeriod,
             openTxnId: lot.id,
             closeTxnId: txn.id,
-            linkedOptionTxnId: lot.linkedOptionTxnId,
+            linkedOptionTxnId: [lot.linkedOptionTxnId, txn.linkedOptionTxnId].filter(Boolean).join(','),
             standardBasis: standardBasis
           });
 
@@ -311,16 +370,16 @@ export function computeTrades(transactions, method = 'FIFO') {
             const totalOptProceeds = optionTxn.type === 'SELL'
               ? (optionTxn.quantity * 100 * optionTxn.price - optionTxn.fees)
               : -(optionTxn.quantity * 100 * optionTxn.price + optionTxn.fees);
-            
+
             const linkedStockTxns = stdTxns.filter(t => t.linkedOptionTxnId && String(t.linkedOptionTxnId).split(',').includes(optId));
             const totalStockQty = linkedStockTxns.reduce((sum, t) => sum + t.quantity, 0);
-            
+
             const proportionalOptProceeds = totalStockQty > 0
               ? (lot.quantity / totalStockQty) * totalOptProceeds
               : (lot.quantity / lot.initialQuantity) * totalOptProceeds;
-            
+
             totalOptProceedsForLot += proportionalOptProceeds;
-            
+
             optionsList.push({
               id: optionTxn.id,
               date: optionTxn.date,
@@ -340,6 +399,9 @@ export function computeTrades(transactions, method = 'FIFO') {
         }
       }
 
+      const originTxn = txnsById[lot.id];
+      const activityType = originTxn?.originalRow?.activityType || originTxn?.originalRow?.type || (lot.type === 'BUY' ? 'Buy' : 'Sell');
+
       allOpenPositions.push({
         symbol: symbol,
         type: lot.type === 'BUY' ? 'LONG' : 'SHORT',
@@ -349,7 +411,8 @@ export function computeTrades(transactions, method = 'FIFO') {
         costBasis: costBasis,
         standardBasis: standardBasis,
         lotId: lot.id,
-        linkedOptions: linkedOptions
+        linkedOptions: linkedOptions,
+        activityType: activityType
       });
     });
   });
@@ -379,6 +442,7 @@ export function generateRealizedReport(trades, startDate, endDate) {
     totalPnL: 0,
     totalCostBasis: 0,
     totalProceeds: 0,
+    totalWashSale: 0,
     shortTermPnL: 0,
     longTermPnL: 0,
     tradeCount: filteredTrades.length,
@@ -389,6 +453,7 @@ export function generateRealizedReport(trades, startDate, endDate) {
     summary.totalPnL += t.realizedPnL;
     summary.totalCostBasis += t.costBasis;
     summary.totalProceeds += t.proceeds;
+    summary.totalWashSale += t.washSaleAmount || 0;
 
     if (t.holdingPeriod === 'LONG_TERM') {
       summary.longTermPnL += t.realizedPnL;
@@ -402,6 +467,7 @@ export function generateRealizedReport(trades, startDate, endDate) {
         realizedPnL: 0,
         costBasis: 0,
         proceeds: 0,
+        washSaleAmount: 0,
         tradeCount: 0,
         volume: 0
       };
@@ -411,6 +477,7 @@ export function generateRealizedReport(trades, startDate, endDate) {
     sym.realizedPnL += t.realizedPnL;
     sym.costBasis += t.costBasis;
     sym.proceeds += t.proceeds;
+    sym.washSaleAmount += t.washSaleAmount || 0;
     sym.tradeCount += 1;
     sym.volume += t.quantity;
   });

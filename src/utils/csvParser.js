@@ -42,15 +42,15 @@ export function parseCSVText(text) {
   return lines.filter(line => line.length > 0 && line.some(cell => cell !== ""));
 }
 
-// Common headers mapped to standard fields
 const FIELD_MAPPINGS = {
   date: ['date', 'activity/trade date', 'activity date', 'trade date', 'transaction date'],
   symbol: ['symbol', 'ticker', 'cusip', 'symbol/ticker'],
-  type: ['type', 'transaction type', 'activity type', 'action', 'description'],
+  type: ['type', 'transaction type', 'activity type', 'action'],
+  description: ['description', 'desc', 'activity description'],
   quantity: ['quantity', 'qty', 'shares', 'quantity #', 'number of shares'],
   price: ['price', 'price $', 'unit price'],
   fees: ['commission', 'fees', 'fee', 'commission $', 'transaction fees'],
-  amount: ['amount', 'amount $', 'net amount', 'gross amount', 'total', 'total amount']
+  amount: ['net amount', 'amount', 'amount $', 'total', 'total amount']
 };
 
 /**
@@ -69,13 +69,16 @@ export function autoDetectHeaders(rows) {
     const currentMappings = {};
     let matchedCount = 0;
 
-    // Check each field's aliases against the row cells
     Object.keys(FIELD_MAPPINGS).forEach(field => {
       const aliases = FIELD_MAPPINGS[field];
-      const colIndex = row.findIndex(cell => {
-        const cleanCell = cell.toLowerCase().replace(/[^a-z0-9#$//\s]/g, '').trim();
-        return aliases.some(alias => cleanCell === alias || cleanCell.includes(alias));
-      });
+      let colIndex = -1;
+      for (const alias of aliases) {
+        colIndex = row.findIndex(cell => {
+          const cleanCell = cell.toLowerCase().replace(/[^a-z0-9#$//\s]/g, '').trim();
+          return cleanCell === alias || cleanCell.includes(alias);
+        });
+        if (colIndex !== -1) break;
+      }
 
       if (colIndex !== -1) {
         currentMappings[field] = colIndex;
@@ -114,7 +117,8 @@ export function computeFingerprint(txn) {
   const quantity = txn.quantity ? parseFloat(txn.quantity).toFixed(4) : '0';
   const price = txn.price ? parseFloat(txn.price).toFixed(4) : '0';
   const amount = txn.amount ? parseFloat(txn.amount).toFixed(2) : '0';
-  const fees = txn.fees ? parseFloat(txn.fees).toFixed(2) : '0';
+  const feesVal = txn.fees !== undefined ? txn.fees : txn.commission;
+  const fees = feesVal ? parseFloat(feesVal).toFixed(2) : '0';
 
   // Join by separator
   const rawString = `${date}|${symbol}|${type}|${quantity}|${price}|${fees}|${amount}`;
@@ -134,36 +138,70 @@ export function computeFingerprint(txn) {
  */
 export function formatToISODate(dateStr) {
   if (!dateStr) return '';
-  const d = new Date(dateStr);
-  if (isNaN(d.getTime())) {
-    // If Date constructor fails, try manually parsing MM/DD/YY or YY-MM-DD
-    const parts = dateStr.split(/[-/]/);
-    if (parts.length === 3) {
-      let m = parseInt(parts[0]);
-      let day = parseInt(parts[1]);
-      let y = parseInt(parts[2]);
+  
+  // Try clean manual digit parsing first to avoid all JS timezone/UTC conversion bugs
+  const digits = dateStr.match(/\d+/g);
+  if (digits && digits.length >= 3) {
+    let year = 0;
+    let month = 0;
+    let day = 0;
+    
+    const part1 = digits[0];
+    const part2 = digits[1];
+    const part3 = digits[2];
+    
+    if (part1.length === 4) {
+      // YYYY-MM-DD or YYYY/MM/DD
+      year = parseInt(part1);
+      month = parseInt(part2);
+      day = parseInt(part3);
+    } else if (part3.length === 4) {
+      // MM/DD/YYYY or DD/MM/YYYY
+      year = parseInt(part3);
+      const val1 = parseInt(part1);
+      const val2 = parseInt(part2);
       
-      // If it's MM/DD/YYYY or MM/DD/YY
-      if (m > 12) {
-        // Could be YYYY-MM-DD
-        y = parseInt(parts[0]);
-        m = parseInt(parts[1]);
-        day = parseInt(parts[2]);
+      if (val1 > 12) {
+        // DD/MM/YYYY
+        day = val1;
+        month = val2;
+      } else {
+        // MM/DD/YYYY
+        month = val1;
+        day = val2;
       }
-
-      if (y < 100) {
-        y += y > 50 ? 1900 : 2000; // rough 2 digit year mapping
-      }
-
-      const pad = (n) => String(n).padStart(2, '0');
-      if (!isNaN(y) && !isNaN(m) && !isNaN(day)) {
-        return `${y}-${pad(m)}-${pad(day)}`;
+    } else {
+      // MM/DD/YY or DD/MM/YY
+      let y = parseInt(part3);
+      year = y + (y > 50 ? 1900 : 2000);
+      const val1 = parseInt(part1);
+      const val2 = parseInt(part2);
+      
+      if (val1 > 12) {
+        day = val1;
+        month = val2;
+      } else {
+        month = val1;
+        day = val2;
       }
     }
-    return dateStr; // Fallback
+    
+    const pad = (n) => String(n).padStart(2, '0');
+    if (!isNaN(year) && !isNaN(month) && !isNaN(day) && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return `${year}-${pad(month)}-${pad(day)}`;
+    }
   }
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
+  
+  // Fallback to JS Date constructor for text-based dates like "May 25, 2026"
+  const d = new Date(dateStr);
+  if (!isNaN(d.getTime())) {
+    const isISO = dateStr.includes('-') && !dateStr.includes('/') && !/[a-zA-Z]/.test(dateStr);
+    
+    const year = isISO ? d.getUTCFullYear() : d.getFullYear();
+    const month = String((isISO ? d.getUTCMonth() : d.getMonth()) + 1).padStart(2, '0');
+    const day = String(isISO ? d.getUTCDate() : d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+  
+  return dateStr;
 }

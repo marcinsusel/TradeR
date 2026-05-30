@@ -17,7 +17,9 @@ export default function Settings() {
     setInventoryMethod,
     clearDatabase,
     transactions,
-    importTransactions
+    importTransactions,
+    useGoogleSheets,
+    updateUseGoogleSheets
   } = useApp();
 
   const [clientIdInput, setClientIdInput] = useState(googleClientId);
@@ -225,6 +227,22 @@ export default function Settings() {
                   </>
                 )}
               </div>
+              
+              {syncStatus !== 'offline' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', borderTop: '1px solid var(--border-color)', paddingTop: '1rem', marginTop: '0.25rem' }}>
+                  <input 
+                    type="checkbox" 
+                    id="useGoogleSheets" 
+                    checked={useGoogleSheets} 
+                    onChange={(e) => updateUseGoogleSheets(e.target.checked)} 
+                    disabled={syncing}
+                    style={{ cursor: syncing ? 'not-allowed' : 'pointer' }}
+                  />
+                  <label htmlFor="useGoogleSheets" style={{ fontSize: '0.85rem', cursor: syncing ? 'not-allowed' : 'pointer', fontWeight: '500', color: 'var(--text-primary)' }}>
+                    Store transactions in Google Sheets (TradeR_Spreadsheet)
+                  </label>
+                </div>
+              )}
             </div>
           )}
 

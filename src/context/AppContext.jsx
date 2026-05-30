@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useMemo } from 'react';
-import { syncAndLoadDatabase, saveDatabaseToDrive, initOAuthClient } from '../utils/googleDrive';
+import { syncAndLoadDatabase, saveDatabaseToDrive, initOAuthClient, syncAndLoadSpreadsheet, saveTransactionsToSpreadsheet, findFolder } from '../utils/googleDrive';
 import { computeTrades } from '../utils/tradeMatcher';
 
 const AppContext = createContext();
@@ -26,14 +26,59 @@ export function deduplicateDatabaseIds(txns) {
   });
 }
 
+export function isDuplicateTransaction(incoming, dbTxns) {
+  if (!Array.isArray(dbTxns) || !incoming) return false;
+
+  // 1. Direct ID match
+  if (dbTxns.some(t => t.id === incoming.id)) {
+    return true;
+  }
+
+  // 2. Composite field check: match Core transaction fields and either date or importedDate
+  const incomingQty = Math.abs(parseFloat(incoming.quantity || 0));
+  const incomingPrice = parseFloat(incoming.price || 0);
+  const incomingAmount = parseFloat(incoming.amount || 0);
+  const incomingComm = parseFloat(incoming.commission !== undefined ? incoming.commission : (incoming.fees || 0));
+
+  return dbTxns.some(t => {
+    if (t.symbol?.toUpperCase() !== incoming.symbol?.toUpperCase()) return false;
+    if (t.type?.toUpperCase() !== incoming.type?.toUpperCase()) return false;
+
+    // Compare numeric values with a small tolerance
+    if (Math.abs(Math.abs(parseFloat(t.quantity || 0)) - incomingQty) > 0.0001) return false;
+    if (Math.abs(parseFloat(t.price || 0) - incomingPrice) > 0.0001) return false;
+    if (Math.abs(parseFloat(t.amount || 0) - incomingAmount) > 0.01) return false;
+
+    const tComm = parseFloat(t.commission !== undefined ? t.commission : (t.fees || 0));
+    if (Math.abs(tComm - incomingComm) > 0.01) return false;
+
+    // Date matches either direct date or original importedDate
+    const datesMatch = (t.date === incoming.date) || (t.importedDate && t.importedDate === incoming.date);
+    return datesMatch;
+  });
+}
+
+
 export function AppProvider({ children }) {
   const [transactions, setTransactions] = useState([]);
-  const [inventoryMethod, setInventoryMethod] = useState('FIFO');
+  const [appSettings, setAppSettings] = useState({
+    inventoryMethod: 'FIFO',
+    noncoveredTickers: []
+  });
+
+  const inventoryMethod = appSettings.inventoryMethod;
+  const setInventoryMethod = (method) => {
+    updateAppSettings({ inventoryMethod: method });
+  };
   
   // Google Drive states
   const [googleClientId, setGoogleClientId] = useState(() => localStorage.getItem('trader_google_client_id') || '');
   const [accessToken, setAccessToken] = useState('');
   const [gdriveFileId, setGdriveFileId] = useState('');
+  const [gdriveSheetId, setGdriveSheetId] = useState('');
+  const [useGoogleSheets, setUseGoogleSheets] = useState(() => {
+    return localStorage.getItem('trader_use_google_sheets') === 'true';
+  });
   const [syncing, setSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState('offline'); // 'offline', 'connected', 'syncing', 'error'
   const [error, setError] = useState('');
@@ -56,12 +101,17 @@ export function AppProvider({ children }) {
               'trader_local_db',
               JSON.stringify({
                 transactions: cleaned,
-                settings: parsed.settings || { inventoryMethod }
+                settings: parsed.settings || appSettings
               })
             );
           }
         }
-        if (parsed.settings?.inventoryMethod) setInventoryMethod(parsed.settings.inventoryMethod);
+        if (parsed.settings) {
+          setAppSettings({
+            inventoryMethod: parsed.settings.inventoryMethod || 'FIFO',
+            noncoveredTickers: parsed.settings.noncoveredTickers || []
+          });
+        }
       } catch (err) {
         console.error('Failed to load local DB', err);
       }
@@ -105,12 +155,12 @@ export function AppProvider({ children }) {
   }, [googleClientId]);
 
   // Save changes locally
-  const saveLocally = (txns, method) => {
+  const saveLocally = (txns, settingsObj = appSettings) => {
     localStorage.setItem(
       'trader_local_db',
       JSON.stringify({
         transactions: txns,
-        settings: { inventoryMethod: method }
+        settings: settingsObj
       })
     );
   };
@@ -124,32 +174,53 @@ export function AppProvider({ children }) {
       const { fileId, data } = await syncAndLoadDatabase(token);
       setGdriveFileId(fileId);
       
-      // Merge local and cloud transactions if there are discrepancies
-      // For simplicity, cloud data wins, but we merge unique transactions.
-      let mergedTxns = data.transactions || [];
+      let mergedTxns = [];
+      const sheetsEnabled = localStorage.getItem('trader_use_google_sheets') === 'true';
+      
+      if (sheetsEnabled) {
+        const folder = await findFolder('TradeR', token);
+        if (folder) {
+          const { sheetId, transactions: sheetTxns } = await syncAndLoadSpreadsheet(folder.id, token);
+          setGdriveSheetId(sheetId);
+          mergedTxns = sheetTxns;
+        }
+      } else {
+        mergedTxns = data.transactions || [];
+      }
+      
       mergedTxns = deduplicateDatabaseIds(mergedTxns);
       
-      // If we have local transactions that aren't in the cloud (e.g. added while offline), 
-      // we can append them. We check by ID.
       const cloudIds = new Set(mergedTxns.map(t => t.id));
       const localOnlyTxns = transactions.filter(t => !cloudIds.has(t.id));
       
+      const loadedSettings = {
+        inventoryMethod: data.settings?.inventoryMethod || appSettings.inventoryMethod,
+        noncoveredTickers: data.settings?.noncoveredTickers || appSettings.noncoveredTickers || []
+      };
+
       if (localOnlyTxns.length > 0) {
         mergedTxns = [...mergedTxns, ...localOnlyTxns];
         mergedTxns = deduplicateDatabaseIds(mergedTxns);
-        // Trigger a save to drive to sync them up
+        
         await saveDatabaseToDrive(fileId, {
-          transactions: mergedTxns,
-          settings: { inventoryMethod: data.settings?.inventoryMethod || inventoryMethod }
+          transactions: sheetsEnabled ? [] : mergedTxns,
+          settings: loadedSettings
         }, token);
+        
+        if (sheetsEnabled) {
+          const folder = await findFolder('TradeR', token);
+          if (folder) {
+            const { sheetId: newSheetId } = await syncAndLoadSpreadsheet(folder.id, token);
+            setGdriveSheetId(newSheetId);
+            await saveTransactionsToSpreadsheet(newSheetId, mergedTxns, token);
+          }
+        }
       }
 
       setTransactions(mergedTxns);
-      if (data.settings?.inventoryMethod) {
-        setInventoryMethod(data.settings.inventoryMethod);
-      }
+      setAppSettings(loadedSettings);
       
-      saveLocally(mergedTxns, data.settings?.inventoryMethod || inventoryMethod);
+      saveLocally(mergedTxns, loadedSettings);
       setSyncStatus('connected');
       setError('');
     } catch (err) {
@@ -161,15 +232,33 @@ export function AppProvider({ children }) {
     }
   };
 
-  const uploadToDrive = async (txns, method, token = accessToken, fileId = gdriveFileId) => {
-    if (!token || !fileId) return;
+  const uploadToDrive = async (txns, settingsObj = appSettings, token = accessToken, fileId = gdriveFileId, useSheets = useGoogleSheets) => {
+    if (!token) return;
     setSyncing(true);
     setSyncStatus('syncing');
     try {
-      await saveDatabaseToDrive(fileId, {
-        transactions: txns,
-        settings: { inventoryMethod: method }
-      }, token);
+      if (fileId) {
+        await saveDatabaseToDrive(fileId, {
+          transactions: useSheets ? [] : txns,
+          settings: settingsObj
+        }, token);
+      }
+      
+      if (useSheets) {
+        let sheetId = gdriveSheetId;
+        if (!sheetId) {
+          const folder = await findFolder('TradeR', token);
+          if (folder) {
+            const { sheetId: newSheetId } = await syncAndLoadSpreadsheet(folder.id, token);
+            sheetId = newSheetId;
+            setGdriveSheetId(sheetId);
+          }
+        }
+        if (sheetId) {
+          await saveTransactionsToSpreadsheet(sheetId, txns, token);
+        }
+      }
+      
       setSyncStatus('connected');
       setError('');
     } catch (err) {
@@ -178,6 +267,15 @@ export function AppProvider({ children }) {
       setSyncStatus('error');
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const updateUseGoogleSheets = async (value) => {
+    setUseGoogleSheets(value);
+    localStorage.setItem('trader_use_google_sheets', String(value));
+    
+    if (accessToken) {
+      await uploadToDrive(transactions, appSettings, accessToken, gdriveFileId, value);
     }
   };
 
@@ -198,56 +296,63 @@ export function AppProvider({ children }) {
     setAuthError('');
   };
 
-  const updateInventoryMethod = async (method) => {
-    setInventoryMethod(method);
-    saveLocally(transactions, method);
+  const updateAppSettings = async (newSettings) => {
+    const merged = {
+      inventoryMethod: newSettings.inventoryMethod !== undefined ? newSettings.inventoryMethod : appSettings.inventoryMethod,
+      noncoveredTickers: newSettings.noncoveredTickers !== undefined ? newSettings.noncoveredTickers : appSettings.noncoveredTickers
+    };
+    setAppSettings(merged);
+    saveLocally(transactions, merged);
     if (accessToken && gdriveFileId) {
-      await uploadToDrive(transactions, method);
+      await uploadToDrive(transactions, merged);
     }
   };
 
+  const updateInventoryMethod = async (method) => {
+    await updateAppSettings({ inventoryMethod: method });
+  };
+
   const importTransactions = async (newTxns) => {
-    // Avoid duplicate insertions
-    const existingIds = new Set(transactions.map(t => t.id));
-    const uniqueNewTxns = newTxns.filter(t => !existingIds.has(t.id));
+    // Avoid duplicate insertions using advanced duplicate prevention logic
+    const uniqueNewTxns = newTxns.filter(t => !isDuplicateTransaction(t, transactions));
     
     if (uniqueNewTxns.length === 0) return 0;
 
     const updatedTxns = [...transactions, ...uniqueNewTxns];
     setTransactions(updatedTxns);
-    saveLocally(updatedTxns, inventoryMethod);
+    saveLocally(updatedTxns, appSettings);
 
     if (accessToken && gdriveFileId) {
-      await uploadToDrive(updatedTxns, inventoryMethod);
+      await uploadToDrive(updatedTxns, appSettings);
     }
     return uniqueNewTxns.length;
   };
 
-  const deleteTransaction = async (id) => {
-    const updated = transactions.filter(t => t.id !== id);
+  const voidTransaction = async (id) => {
+    const updated = transactions.map(t => t.id === id ? { ...t, voided: !t.voided } : t);
     setTransactions(updated);
-    saveLocally(updated, inventoryMethod);
+    saveLocally(updated, appSettings);
 
     if (accessToken && gdriveFileId) {
-      await uploadToDrive(updated, inventoryMethod);
+      await uploadToDrive(updated, appSettings);
     }
   };
 
   const clearDatabase = async () => {
     setTransactions([]);
-    saveLocally([], inventoryMethod);
+    saveLocally([], appSettings);
 
     if (accessToken && gdriveFileId) {
-      await uploadToDrive([], inventoryMethod);
+      await uploadToDrive([], appSettings);
     }
   };
 
   const updateTransactions = async (updatedTxns) => {
     setTransactions(updatedTxns);
-    saveLocally(updatedTxns, inventoryMethod);
+    saveLocally(updatedTxns, appSettings);
 
     if (accessToken && gdriveFileId) {
-      await uploadToDrive(updatedTxns, inventoryMethod);
+      await uploadToDrive(updatedTxns, appSettings);
     }
   };
 
@@ -262,6 +367,8 @@ export function AppProvider({ children }) {
     openPositions: computedData.openPositions,
     inventoryMethod,
     setInventoryMethod: updateInventoryMethod,
+    appSettings,
+    updateAppSettings,
     
     // Auth and sync state
     googleClientId,
@@ -275,12 +382,15 @@ export function AppProvider({ children }) {
     setAuthError,
     signOut,
     triggerManualSync: () => loadFromDrive(),
+    useGoogleSheets,
+    updateUseGoogleSheets,
     
     // Mutators
     importTransactions,
-    deleteTransaction,
+    voidTransaction,
     updateTransactions,
-    clearDatabase
+    clearDatabase,
+    isDuplicateTransaction
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

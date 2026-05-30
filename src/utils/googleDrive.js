@@ -1,6 +1,7 @@
 /**
  * Google Drive API REST Client using direct Fetch and Google Identity Services.
  */
+import { parseCSVText } from './csvParser';
 
 const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 let tokenClient = null;
@@ -92,7 +93,7 @@ async function apiRequest(url, method = 'GET', token, body = null, headers = {})
 /**
  * Searches for a folder by name. Returns the folder object or null.
  */
-async function findFolder(name, token) {
+export async function findFolder(name, token) {
   const query = encodeURIComponent(`name = '${name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
   const url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name)`;
   const res = await apiRequest(url, 'GET', token);
@@ -251,4 +252,154 @@ export async function syncAndLoadDatabase(token) {
 export async function saveDatabaseToDrive(fileId, data, token) {
   if (!fileId) throw new Error('Cannot save: No Google Drive file ID available.');
   return updateFileContent(fileId, data, token);
+}
+
+/**
+ * Converts transactions array to a clean CSV string for Sheets storage.
+ */
+export function transactionsToCSV(transactions) {
+  const headers = ['id', 'date', 'symbol', 'type', 'quantity', 'price', 'commission', 'amount', 'activityType', 'note', 'voided'];
+  const rows = [headers.join(',')];
+  
+  transactions.forEach(t => {
+    const row = [
+      t.id || '',
+      t.date || '',
+      t.symbol || '',
+      t.type || '',
+      t.quantity || 0,
+      t.price || 0,
+      t.commission || 0,
+      t.amount || 0,
+      t.activityType || '',
+      // Escape note quotes
+      `"${(t.note || '').replace(/"/g, '""')}"`,
+      t.voided ? 'true' : 'false'
+    ];
+    rows.push(row.join(','));
+  });
+  
+  return rows.join('\n');
+}
+
+/**
+ * Converts CSV rows back into standard transaction objects.
+ */
+export function csvToTransactions(csvRows) {
+  if (csvRows.length <= 1) return [];
+  
+  const headers = csvRows[0].map(h => h.trim().toLowerCase());
+  const transactions = [];
+  
+  for (let i = 1; i < csvRows.length; i++) {
+    const row = csvRows[i];
+    if (row.length < 3 || !row[0]) continue;
+    
+    const txn = {};
+    headers.forEach((header, idx) => {
+      const val = row[idx] || '';
+      if (header === 'quantity' || header === 'price' || header === 'commission' || header === 'amount') {
+        txn[header] = parseFloat(val) || 0;
+      } else if (header === 'voided') {
+        txn[header] = val === 'true';
+      } else {
+        txn[header] = val;
+      }
+    });
+    
+    transactions.push({
+      id: txn.id,
+      date: txn.date,
+      symbol: txn.symbol,
+      type: txn.type,
+      quantity: txn.quantity,
+      price: txn.price,
+      commission: txn.commission || txn.fees || 0,
+      amount: txn.amount,
+      activityType: txn.activitytype || txn.type,
+      note: txn.note,
+      voided: !!txn.voided
+    });
+  }
+  
+  return transactions;
+}
+
+/**
+ * Synchronizes and loads spreadsheet from Google Drive, creating it if it doesn't exist.
+ */
+export async function syncAndLoadSpreadsheet(folderId, token) {
+  let file = await findFileInFolder('TradeR_Spreadsheet', folderId, token);
+  
+  if (!file) {
+    const headersCSV = "id,date,symbol,type,quantity,price,commission,amount,activityType,note,voided\n";
+    
+    const metadata = {
+      name: 'TradeR_Spreadsheet',
+      parents: [folderId],
+      mimeType: 'application/vnd.google-apps.spreadsheet'
+    };
+    
+    const boundary = 'trader_boundary_marker';
+    const multipartBody = 
+      `--${boundary}\r\n` +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(metadata) +
+      `\r\n--${boundary}\r\n` +
+      'Content-Type: text/csv\r\n\r\n' +
+      headersCSV +
+      `\r\n--${boundary}--`;
+      
+    const url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+    const newFile = await apiRequest(url, 'POST', token, multipartBody, {
+      'Content-Type': `multipart/related; boundary=${boundary}`
+    });
+    
+    return {
+      sheetId: newFile.id,
+      transactions: []
+    };
+  }
+  
+  // Download/Export Google Sheet as CSV
+  const url = `https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/csv`;
+  const response = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Failed to export Google Sheet as CSV. Status ${response.status}`);
+  }
+  
+  const csvText = await response.text();
+  const rows = parseCSVText(csvText);
+  const txns = csvToTransactions(rows);
+  
+  return {
+    sheetId: file.id,
+    transactions: txns
+  };
+}
+
+/**
+ * Saves transactions to the Google Sheets spreadsheet.
+ */
+export async function saveTransactionsToSpreadsheet(sheetId, transactions, token) {
+  const csvContent = transactionsToCSV(transactions);
+  const url = `https://www.googleapis.com/upload/drive/v3/files/${sheetId}?uploadType=media`;
+  
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'text/csv'
+    },
+    body: csvContent
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Failed to save transactions to Google Sheets. Status ${response.status}`);
+  }
+  
+  return response.json();
 }

@@ -4,18 +4,97 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { TrendingUp, TrendingDown, DollarSign, Award, Layers, HelpCircle, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react';
 
 export default function Dashboard() {
-  const { trades, openPositions } = useApp();
+  const { trades, openPositions, transactions } = useApp();
   const [sortConfig, setSortConfig] = useState({ key: 'pnl', direction: 'desc' });
 
+  // Time picker states
+  const [datePreset, setDatePreset] = useState('YTD');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+
+  // Calculate preset date ranges dynamically based on current local date
+  const getDateRangeForPreset = (preset) => {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth(); // 0-indexed
+    
+    let start = '';
+    let end = '';
+
+    const pad = (n) => String(n).padStart(2, '0');
+
+    if (preset === 'YTD') {
+      start = `${currentYear}-01-01`;
+      end = `${currentYear}-${pad(currentMonth + 1)}-${pad(now.getDate())}`;
+    } else if (preset === 'LAST_YEAR') {
+      const lastYear = currentYear - 1;
+      start = `${lastYear}-01-01`;
+      end = `${lastYear}-12-31`;
+    } else if (preset === 'PREV_MONTH') {
+      let prevMonthYear = currentYear;
+      let prevMonth = currentMonth - 1;
+      if (prevMonth < 0) {
+        prevMonth = 11;
+        prevMonthYear -= 1;
+      }
+      start = `${prevMonthYear}-${pad(prevMonth + 1)}-01`;
+      const lastDay = new Date(prevMonthYear, prevMonth + 1, 0).getDate();
+      end = `${prevMonthYear}-${pad(prevMonth + 1)}-${pad(lastDay)}`;
+    } else if (preset === 'ALL_TIME') {
+      start = '';
+      end = '';
+    }
+
+    return { start, end };
+  };
+
+  // Filter completed trades by closing date preset
+  const filteredTrades = useMemo(() => {
+    let presetStart = startDate;
+    let presetEnd = endDate;
+    
+    if (datePreset !== 'CUSTOM') {
+      const range = getDateRangeForPreset(datePreset);
+      presetStart = range.start;
+      presetEnd = range.end;
+    }
+
+    return trades.filter(t => {
+      const date = t.closeDate;
+      const matchStart = !presetStart || date >= presetStart;
+      const matchEnd = !presetEnd || date <= presetEnd;
+      return matchStart && matchEnd;
+    });
+  }, [trades, datePreset, startDate, endDate]);
+
+  // Filter raw transactions by date preset
+  const filteredTransactions = useMemo(() => {
+    let presetStart = startDate;
+    let presetEnd = endDate;
+    
+    if (datePreset !== 'CUSTOM') {
+      const range = getDateRangeForPreset(datePreset);
+      presetStart = range.start;
+      presetEnd = range.end;
+    }
+
+    return transactions.filter(t => {
+      const date = t.date;
+      const matchStart = !presetStart || date >= presetStart;
+      const matchEnd = !presetEnd || date <= presetEnd;
+      return matchStart && matchEnd;
+    });
+  }, [transactions, datePreset, startDate, endDate]);
+
   const metrics = useMemo(() => {
-    let totalPnL = 0;
+    let tradesPnL = 0;
     let profitableTrades = 0;
     let lossTrades = 0;
     let totalWins = 0;
     let totalLosses = 0;
     
-    trades.forEach(t => {
-      totalPnL += t.realizedPnL;
+    filteredTrades.forEach(t => {
+      tradesPnL += t.realizedPnL;
       if (t.realizedPnL > 0) {
         profitableTrades++;
         totalWins += t.realizedPnL;
@@ -25,7 +104,31 @@ export default function Dashboard() {
       }
     });
 
-    const totalClosedCount = trades.length;
+    // Sum other fees, interest, transfers, and dividends (exclude voided)
+    let totalFees = 0;
+    let totalInterest = 0;
+    let totalTransfers = 0;
+    let totalDividends = 0;
+    
+    filteredTransactions.forEach(t => {
+      if (t.voided) return;
+      const amt = parseFloat(t.amount) || 0;
+      if (t.type === 'FEE') {
+        totalFees += amt;
+      } else if (t.type === 'INTEREST') {
+        totalInterest += amt;
+      } else if (t.type === 'TRANSFER') {
+        totalTransfers += amt;
+      } else if (t.type === 'DIVIDEND') {
+        totalDividends += amt;
+      }
+    });
+
+    const totalFeesAndInterest = totalFees + totalInterest;
+    const totalPnL = tradesPnL + totalFeesAndInterest + totalDividends;
+    const accountBalance = totalTransfers + totalPnL;
+
+    const totalClosedCount = filteredTrades.length;
     const winRate = totalClosedCount > 0 ? (profitableTrades / totalClosedCount) * 100 : 0;
     const profitFactor = totalLosses > 0 ? totalWins / totalLosses : totalWins > 0 ? 99.9 : 0;
 
@@ -33,7 +136,14 @@ export default function Dashboard() {
     const openCost = openPositions.reduce((acc, pos) => acc + pos.costBasis, 0);
 
     return {
+      tradesPnL,
+      totalFees,
+      totalInterest,
+      totalFeesAndInterest,
+      totalTransfers,
+      totalDividends,
       totalPnL,
+      accountBalance,
       winRate,
       profitFactor,
       totalClosedCount,
@@ -42,14 +152,14 @@ export default function Dashboard() {
       openCost,
       openCount: openPositions.length
     };
-  }, [trades, openPositions]);
+  }, [filteredTrades, openPositions, filteredTransactions]);
 
   // Aggregate cumulative PnL over time for chart
   const chartData = useMemo(() => {
-    if (trades.length === 0) return [];
+    if (filteredTrades.length === 0) return [];
     
     // Sort trades oldest closeDate to newest
-    const sortedTrades = [...trades].sort((a, b) => new Date(a.closeDate) - new Date(b.closeDate));
+    const sortedTrades = [...filteredTrades].sort((a, b) => new Date(a.closeDate) - new Date(b.closeDate));
     
     const dailyPnL = {};
     sortedTrades.forEach(t => {
@@ -67,13 +177,16 @@ export default function Dashboard() {
         pnl: parseFloat(cumulative.toFixed(2))
       };
     });
-  }, [trades]);
+  }, [filteredTrades]);
 
   // Top profitable and unprofitable tickers
   const tickerStats = useMemo(() => {
     const stats = {};
-    trades.forEach(t => {
-      stats[t.symbol] = (stats[t.symbol] || 0) + t.realizedPnL;
+    filteredTrades.forEach(t => {
+      const baseTicker = t.symbol ? t.symbol.trim().split(/\s+/)[0] : '';
+      if (baseTicker) {
+        stats[baseTicker] = (stats[baseTicker] || 0) + t.realizedPnL;
+      }
     });
 
     const sorted = Object.entries(stats).map(([symbol, pnl]) => ({ symbol, pnl }));
@@ -81,16 +194,19 @@ export default function Dashboard() {
     const losers = sorted.filter(s => s.pnl < 0).sort((a, b) => a.pnl - b.pnl).slice(0, 5);
     
     return { winners, losers };
-  }, [trades]);
+  }, [filteredTrades]);
 
   // Aggregate PnL by ticker
   const pnlByTicker = useMemo(() => {
     const stats = {};
-    trades.forEach(t => {
-      stats[t.symbol] = (stats[t.symbol] || 0) + t.realizedPnL;
+    filteredTrades.forEach(t => {
+      const baseTicker = t.symbol ? t.symbol.trim().split(/\s+/)[0] : '';
+      if (baseTicker) {
+        stats[baseTicker] = (stats[baseTicker] || 0) + t.realizedPnL;
+      }
     });
     return Object.entries(stats).map(([symbol, pnl]) => ({ symbol, pnl }));
-  }, [trades]);
+  }, [filteredTrades]);
 
   // Sort PnL by ticker data
   const sortedPnlByTicker = useMemo(() => {
@@ -147,13 +263,130 @@ export default function Dashboard() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
-      <div>
-        <h1 className="glow-text" style={{ fontSize: '2.25rem', marginBottom: '0.5rem' }}>Portfolio Dashboard</h1>
-        <p style={{ color: 'var(--text-secondary)' }}>Welcome to TradeR. Here is an overview of your trading activity.</p>
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: '1.5rem'
+      }}>
+        <div>
+          <h1 className="glow-text" style={{ fontSize: '2.25rem', marginBottom: '0.5rem' }}>Portfolio Dashboard</h1>
+          <p style={{ color: 'var(--text-secondary)' }}>Welcome to TradeR. Here is an overview of your trading activity.</p>
+        </div>
+
+        {/* Time Picker Container */}
+        <div style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-end',
+          gap: '0.75rem'
+        }}>
+          {/* Preset Buttons */}
+          <div style={{
+            display: 'flex',
+            background: 'var(--bg-secondary)',
+            border: '1px solid var(--border-color)',
+            borderRadius: '24px',
+            padding: '4px',
+            gap: '2px',
+            alignItems: 'center'
+          }}>
+            {[
+              { id: 'YTD', label: 'YTD' },
+              { id: 'LAST_YEAR', label: 'Last Year' },
+              { id: 'PREV_MONTH', label: 'Previous Month' },
+              { id: 'ALL_TIME', label: 'All Time' },
+              { id: 'CUSTOM', label: 'Custom Dates' }
+            ].map(preset => {
+              const active = datePreset === preset.id;
+              return (
+                <button
+                  key={preset.id}
+                  onClick={() => setDatePreset(preset.id)}
+                  style={{
+                    background: active ? 'var(--color-primary)' : 'transparent',
+                    border: 'none',
+                    borderRadius: '20px',
+                    color: active ? '#ffffff' : 'var(--text-secondary)',
+                    padding: '6px 14px',
+                    fontSize: '0.8rem',
+                    fontWeight: active ? '600' : '500',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s ease',
+                    outline: 'none',
+                    whiteSpace: 'nowrap'
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!active) {
+                      e.currentTarget.style.color = 'var(--text-primary)';
+                      e.currentTarget.style.background = 'rgba(255, 255, 255, 0.04)';
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!active) {
+                      e.currentTarget.style.color = 'var(--text-secondary)';
+                      e.currentTarget.style.background = 'transparent';
+                    }
+                  }}
+                >
+                  {preset.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Custom Date Inputs (only when Custom is selected) */}
+          {datePreset === 'CUSTOM' && (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              animation: 'fadeIn 0.2s ease-out'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>From:</span>
+                <input
+                  type="date"
+                  className="form-input"
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
+                  style={{
+                    padding: '4px 8px',
+                    fontSize: '0.8rem',
+                    width: '130px',
+                    background: 'var(--bg-secondary)',
+                    border: '1px solid var(--border-color)',
+                    color: 'var(--text-primary)',
+                    borderRadius: '6px'
+                  }}
+                />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>To:</span>
+                <input
+                  type="date"
+                  className="form-input"
+                  value={endDate}
+                  onChange={(e) => setEndDate(e.target.value)}
+                  style={{
+                    padding: '4px 8px',
+                    fontSize: '0.8rem',
+                    width: '130px',
+                    background: 'var(--bg-secondary)',
+                    border: '1px solid var(--border-color)',
+                    color: 'var(--text-primary)',
+                    borderRadius: '6px'
+                  }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* KPI Cards Grid */}
-      <div className="grid-cols-4">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1.5rem' }}>
         {/* Net Realized Gain/Loss */}
         <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
           <div style={{
@@ -172,47 +405,53 @@ export default function Dashboard() {
             <h2 className={metrics.totalPnL >= 0 ? 'gain-text' : 'loss-text'} style={{ fontSize: '1.5rem', marginTop: '0.25rem' }}>
               {formatCurrency(metrics.totalPnL)}
             </h2>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginTop: '0.25rem' }}>
+              Trades: {formatCurrency(metrics.tradesPnL)} | Divs: {formatCurrency(metrics.totalDividends)} | Fees: {formatCurrency(metrics.totalFeesAndInterest)}
+            </span>
           </div>
         </div>
 
-        {/* Win Rate */}
+        {/* Account Balance */}
+        <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
+          <div style={{
+            background: 'rgba(16, 185, 129, 0.1)',
+            border: '1px solid rgba(16, 185, 129, 0.2)',
+            borderRadius: '12px', padding: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center'
+          }}>
+            <DollarSign size={24} className="gain-text" />
+          </div>
+          <div>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Account Balance</span>
+            <h2 style={{ fontSize: '1.5rem', marginTop: '0.25rem' }}>
+              {formatCurrency(metrics.accountBalance)}
+            </h2>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginTop: '0.25rem' }}>
+              Net Deposits + Total PnL
+            </span>
+          </div>
+        </div>
+
+        {/* Net Deposits (Basis) */}
         <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
           <div style={{
             background: 'rgba(99, 102, 241, 0.1)',
             border: '1px solid rgba(99, 102, 241, 0.2)',
             borderRadius: '12px', padding: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center'
           }}>
-            <Award size={24} style={{ color: 'var(--color-primary)' }} />
+            <ArrowUp size={24} style={{ color: 'var(--color-primary)' }} />
           </div>
           <div>
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Win Rate</span>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Net Deposits (Basis)</span>
             <h2 style={{ fontSize: '1.5rem', marginTop: '0.25rem' }}>
-              {metrics.winRate.toFixed(1)}%
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginLeft: '0.5rem', fontWeight: 'normal' }}>
-                ({metrics.profitableTrades} of {metrics.totalClosedCount})
-              </span>
+              {formatCurrency(metrics.totalTransfers)}
             </h2>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginTop: '0.25rem' }}>
+              Total Capital Transferred
+            </span>
           </div>
         </div>
 
-        {/* Profit Factor */}
-        <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
-          <div style={{
-            background: 'rgba(6, 182, 212, 0.1)',
-            border: '1px solid rgba(6, 182, 212, 0.2)',
-            borderRadius: '12px', padding: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center'
-          }}>
-            <DollarSign size={24} style={{ color: 'var(--color-secondary)' }} />
-          </div>
-          <div>
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Profit Factor</span>
-            <h2 style={{ fontSize: '1.5rem', marginTop: '0.25rem' }}>
-              {metrics.profitFactor.toFixed(2)}
-            </h2>
-          </div>
-        </div>
-
-        {/* Open Positions Value */}
+        {/* Open Capital */}
         <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
           <div style={{
             background: 'rgba(245, 158, 11, 0.1)',
@@ -225,16 +464,56 @@ export default function Dashboard() {
             <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Open Capital</span>
             <h2 style={{ fontSize: '1.5rem', marginTop: '0.25rem' }}>
               {formatCurrency(metrics.openCost)}
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginLeft: '0.5rem', fontWeight: 'normal' }}>
-                ({metrics.openCount} positions)
-              </span>
             </h2>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginTop: '0.25rem' }}>
+              {metrics.openCount} active positions
+            </span>
+          </div>
+        </div>
+
+        {/* Win Rate */}
+        <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
+          <div style={{
+            background: 'rgba(168, 85, 247, 0.1)',
+            border: '1px solid rgba(168, 85, 247, 0.2)',
+            borderRadius: '12px', padding: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center'
+          }}>
+            <Award size={24} style={{ color: '#a855f7' }} />
+          </div>
+          <div>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Win Rate</span>
+            <h2 style={{ fontSize: '1.5rem', marginTop: '0.25rem' }}>
+              {metrics.winRate.toFixed(1)}%
+            </h2>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginTop: '0.25rem' }}>
+              {metrics.profitableTrades} of {metrics.totalClosedCount} closed trades
+            </span>
+          </div>
+        </div>
+
+        {/* Profit Factor */}
+        <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
+          <div style={{
+            background: 'rgba(6, 182, 212, 0.1)',
+            border: '1px solid rgba(6, 182, 212, 0.2)',
+            borderRadius: '12px', padding: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center'
+          }}>
+            <ArrowUpDown size={24} style={{ color: 'var(--color-secondary)' }} />
+          </div>
+          <div>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Profit Factor</span>
+            <h2 style={{ fontSize: '1.5rem', marginTop: '0.25rem' }}>
+              {metrics.profitFactor.toFixed(2)}
+            </h2>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginTop: '0.25rem' }}>
+              Gross Wins / Gross Losses
+            </span>
           </div>
         </div>
       </div>
 
       {/* Main Charts & Rankings Row */}
-      <div className="grid-cols-3" style={{ gridTemplateColumns: '2fr 1fr' }}>
+      <div className="dashboard-charts-grid">
         {/* Cumulative Performance Chart */}
         <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
           <h3>Performance Curve</h3>
@@ -375,6 +654,12 @@ export default function Dashboard() {
           </div>
         )}
       </div>
+      <style>{`
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(-4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      `}</style>
     </div>
   );
 }

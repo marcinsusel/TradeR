@@ -45,7 +45,7 @@ const getSortedData = (data, sortConfig, tabName) => {
 };
 
 export default function TradesList() {
-  const { trades, openPositions, transactions, deleteTransaction, importTransactions, updateTransactions } = useApp();
+  const { trades, openPositions, transactions, voidTransaction, importTransactions, updateTransactions } = useApp();
   
   // Tab state
   const [activeTab, setActiveTab] = useState('completed'); // 'completed' | 'open' | 'transactions'
@@ -65,6 +65,36 @@ export default function TradesList() {
   const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
   const [assignModalSelectedOptionIds, setAssignModalSelectedOptionIds] = useState(new Set());
   const [assignModalSelectedStockIds, setAssignModalSelectedStockIds] = useState(new Set());
+
+  // Transaction Editing State
+  const [editingTxnId, setEditingTxnId] = useState(null);
+  const [editForm, setEditForm] = useState({ date: '', voided: false });
+
+  const handleSaveTxnEdit = async (txnId) => {
+    const updated = transactions.map(t => {
+      if (t.id === txnId) {
+        const originalDate = t.importedDate || t.date;
+        const newDate = editForm.date;
+        const wasDateChanged = newDate !== t.date;
+        
+        const updatedTxn = {
+          ...t,
+          date: newDate,
+          voided: editForm.voided
+        };
+        
+        if (wasDateChanged) {
+          updatedTxn.importedDate = originalDate;
+        }
+        
+        return updatedTxn;
+      }
+      return t;
+    });
+
+    await updateTransactions(updated);
+    setEditingTxnId(null);
+  };
 
   const toggleExpandSymbol = (symbol) => {
     setExpandedSymbols(prev => {
@@ -290,6 +320,7 @@ export default function TradesList() {
   const [typeFilter, setTypeFilter] = useState('ALL'); // 'ALL' | 'LONG' | 'SHORT'
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
+  const [statusFilter, setStatusFilter] = useState('ALL'); // 'ALL' | 'ACTIVE' | 'VOIDED'
 
   // Sorting state per tab
   const [completedSort, setCompletedSort] = useState({ key: 'closeDate', direction: 'desc' });
@@ -348,17 +379,25 @@ export default function TradesList() {
           symbol: p.symbol,
           type: p.type,
           quantity: 0,
-          costBasis: 0
+          costBasis: 0,
+          activityTypes: new Set()
         };
       }
       groups[p.symbol].quantity += p.quantity;
       groups[p.symbol].costBasis += p.costBasis;
+      if (p.activityType) {
+        groups[p.symbol].activityTypes.add(p.activityType);
+      }
     });
 
-    const positionsArray = Object.values(groups).map(pos => ({
-      ...pos,
-      costBasisPerUnit: pos.quantity > 0 ? pos.costBasis / pos.quantity : 0
-    }));
+    const positionsArray = Object.values(groups).map(pos => {
+      const types = Array.from(pos.activityTypes);
+      return {
+        ...pos,
+        activityType: types.length > 0 ? types.join(', ') : 'Buy',
+        costBasisPerUnit: pos.quantity > 0 ? pos.costBasis / pos.quantity : 0
+      };
+    });
 
     return getSortedData(positionsArray, positionsSort, 'positions');
   }, [openPositions, tickerSearch, typeFilter, startDate, endDate, positionsSort]);
@@ -394,17 +433,31 @@ export default function TradesList() {
         const qty = parseFloat(t.quantity);
         type = qty < 0 ? 'SELL' : 'BUY';
       }
-      const matchType = typeFilter === 'ALL' || type === typeFilter;
+      
+      let matchType = typeFilter === 'ALL';
+      if (!matchType) {
+        if (typeFilter === 'LONG' && type === 'BUY') matchType = true;
+        else if (typeFilter === 'SHORT' && type === 'SELL') matchType = true;
+        else matchType = type === typeFilter;
+      }
 
       const tradeDate = new Date(t.date);
       const matchStart = !startDate || tradeDate >= new Date(startDate);
       const matchEnd = !endDate || tradeDate <= new Date(endDate);
 
-      return matchTicker && matchType && matchStart && matchEnd;
+      const isVoided = !!t.voided;
+      let matchStatus = true;
+      if (statusFilter === 'ACTIVE') {
+        matchStatus = !isVoided;
+      } else if (statusFilter === 'VOIDED') {
+        matchStatus = isVoided;
+      }
+
+      return matchTicker && matchType && matchStart && matchEnd && matchStatus;
     });
 
     return getSortedData(filtered, transactionSort, 'transactions');
-  }, [transactions, tickerSearch, typeFilter, startDate, endDate, transactionSort]);
+  }, [transactions, tickerSearch, typeFilter, startDate, endDate, transactionSort, statusFilter]);
 
   const handleSort = (tab, key) => {
     if (tab === 'completed') {
@@ -570,6 +623,10 @@ export default function TradesList() {
             <option value="ALL">All</option>
             <option value="LONG">Long</option>
             <option value="SHORT">Short</option>
+            <option value="FEE">Fee</option>
+            <option value="INTEREST">Interest</option>
+            <option value="TRANSFER">Transfer</option>
+            <option value="DIVIDEND">Dividend</option>
           </select>
         </div>
 
@@ -595,8 +652,25 @@ export default function TradesList() {
           />
         </div>
 
+        {/* Status (Only on Audit Log) */}
+        {activeTab === 'transactions' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Status:</span>
+            <select 
+              className="form-input" 
+              style={{ width: '110px', padding: '0.4rem 0.75rem' }}
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+            >
+              <option value="ALL">All</option>
+              <option value="ACTIVE">Active</option>
+              <option value="VOIDED">Voided</option>
+            </select>
+          </div>
+        )}
+
         {/* Reset */}
-        {(tickerSearch || typeFilter !== 'ALL' || startDate || endDate) && (
+        {(tickerSearch || typeFilter !== 'ALL' || startDate || endDate || (activeTab === 'transactions' && statusFilter !== 'ALL')) && (
           <button 
             className="btn btn-secondary" 
             style={{ padding: '0.4rem 1rem' }}
@@ -605,6 +679,7 @@ export default function TradesList() {
               setTypeFilter('ALL');
               setStartDate('');
               setEndDate('');
+              setStatusFilter('ALL');
             }}
           >
             Clear Filters
@@ -748,6 +823,7 @@ export default function TradesList() {
                     </th>
                     {renderSortableHeader('positions', 'symbol', 'Ticker')}
                     {renderSortableHeader('positions', 'type', 'Type')}
+                    {renderSortableHeader('positions', 'activityType', 'Activity Type')}
                     {renderSortableHeader('positions', 'quantity', 'Quantity')}
                     {renderSortableHeader('positions', 'costBasis', 'Cost Basis')}
                     {renderSortableHeader('positions', 'costBasisPerUnit', 'Cost Basis/Unit')}
@@ -786,6 +862,11 @@ export default function TradesList() {
                               {pos.type}
                             </span>
                           </td>
+                          <td>
+                            <span className="badge badge-warning" style={{ background: 'rgba(255,255,255,0.03)', color: 'var(--text-secondary)', border: '1px solid rgba(255,255,255,0.08)', fontSize: '0.7rem' }}>
+                              {pos.activityType || 'Buy'}
+                            </span>
+                          </td>
                           <td>{pos.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
                           <td style={{ fontWeight: '500' }}>{formatCurrency(pos.costBasis)}</td>
                           <td>{formatCurrency(pos.costBasisPerUnit)}</td>
@@ -793,7 +874,7 @@ export default function TradesList() {
 
                         {isExpanded && (
                           <tr className="inner-expand-container">
-                            <td colSpan={7} style={{ background: 'var(--bg-secondary)', padding: '1rem 1rem 1.5rem 2.5rem' }}>
+                            <td colSpan={8} style={{ background: 'var(--bg-secondary)', padding: '1rem 1rem 1.5rem 2.5rem' }}>
                               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                                 <h4 style={{ fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-secondary)' }}>
                                   Open Lots for {pos.symbol}
@@ -805,6 +886,7 @@ export default function TradesList() {
                                         <tr>
                                           <th style={{ width: '40px' }}></th>
                                           <th>Open Date</th>
+                                          <th>Activity Type</th>
                                           <th>Quantity</th>
                                           <th>Standard Cost Basis</th>
                                           <th>Current Cost Basis</th>
@@ -830,6 +912,11 @@ export default function TradesList() {
                                                   )}
                                                 </td>
                                                 <td>{lot.openDate}</td>
+                                                <td>
+                                                  <span className="badge badge-warning" style={{ background: 'rgba(255,255,255,0.03)', color: 'var(--text-secondary)', border: '1px solid rgba(255,255,255,0.08)', fontSize: '0.7rem' }}>
+                                                    {lot.activityType || 'Buy'}
+                                                  </span>
+                                                </td>
                                                 <td>{lot.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
                                                 <td>{formatCurrency(lot.standardBasis)}</td>
                                                 <td style={{ fontWeight: '500' }}>
@@ -853,7 +940,7 @@ export default function TradesList() {
                                               
                                               {isLotExpanded && lot.linkedOptions && lot.linkedOptions.length > 0 && (
                                                 <tr>
-                                                  <td colSpan={6} style={{ background: 'var(--bg-tertiary)', padding: '1rem' }}>
+                                                  <td colSpan={7} style={{ background: 'var(--bg-tertiary)', padding: '1rem' }}>
                                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                                                       <h5 style={{ margin: 0, color: 'var(--color-success)', fontSize: '0.85rem', fontWeight: '600' }}>
                                                         Option Assignment Details ({lot.linkedOptions.length} linked option{lot.linkedOptions.length > 1 ? 's' : ''})
@@ -942,6 +1029,7 @@ export default function TradesList() {
                     {renderSortableHeader('open', 'symbol', 'Ticker')}
                     {renderSortableHeader('open', 'type', 'Type')}
                     {renderSortableHeader('open', 'openDate', 'Open Date')}
+                    {renderSortableHeader('open', 'activityType', 'Activity Type')}
                     {renderSortableHeader('open', 'quantity', 'Quantity')}
                     {renderSortableHeader('open', 'openPrice', 'Open Price')}
                     {renderSortableHeader('open', 'costBasis', 'Current Cost Basis')}
@@ -958,6 +1046,11 @@ export default function TradesList() {
                         </span>
                       </td>
                       <td>{pos.openDate}</td>
+                      <td>
+                        <span className="badge badge-warning" style={{ background: 'rgba(255,255,255,0.03)', color: 'var(--text-secondary)', border: '1px solid rgba(255,255,255,0.08)', fontSize: '0.7rem' }}>
+                          {pos.activityType || 'Buy'}
+                        </span>
+                      </td>
                       <td>{pos.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
                       <td>{formatCurrency(pos.openPrice)}</td>
                       <td style={{ fontWeight: '500' }}>{formatCurrency(pos.costBasis)}</td>
@@ -995,37 +1088,121 @@ export default function TradesList() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredTransactions.map((t) => (
-                    <tr key={t.id}>
-                      <td>{t.date}</td>
-                      <td style={{ fontWeight: '600' }}>{t.symbol}</td>
-                      <td>
-                        <span className={`badge ${t.type === 'BUY' ? 'badge-success' : 'badge-danger'}`}>
-                          {t.activityType || t.type}
-                        </span>
-                      </td>
-                      <td>{t.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
-                      <td>{formatCurrency(t.price)}</td>
-                      <td>{formatCurrency(t.commission || 0)}</td>
-                      <td style={{ fontWeight: '500' }} className={t.amount >= 0 ? 'gain-text' : 'loss-text'}>
-                        {formatCurrency(t.amount)}
-                      </td>
-                      <td style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t.id}</td>
-                      <td>
-                        <button 
-                          className="btn btn-danger" 
-                          style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
-                          onClick={() => {
-                            if (window.confirm('Are you sure you want to delete this transaction? It will affect linked trades immediately.')) {
-                              deleteTransaction(t.id);
-                            }
-                          }}
-                        >
-                          Delete
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredTransactions.map((t) => {
+                    const isEdited = editingTxnId === t.id;
+                    return (
+                      <React.Fragment key={t.id}>
+                        <tr style={t.voided ? { opacity: 0.5, textDecoration: 'line-through' } : {}}>
+                          <td>{t.date}</td>
+                          <td>
+                            <div style={{ fontWeight: '600' }}>{t.symbol || '-'}</div>
+                            {t.description && (
+                              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontWeight: 'normal', marginTop: '0.15rem', maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.description}>
+                                {t.description}
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            {t.type === 'BUY' && <span className="badge badge-success">{t.activityType || 'BUY'}</span>}
+                            {t.type === 'SELL' && <span className="badge badge-danger">{t.activityType || 'SELL'}</span>}
+                            {t.type === 'FEE' && <span className="badge badge-warning">{t.activityType || 'FEE'}</span>}
+                            {t.type === 'INTEREST' && (
+                              <span className="badge" style={{ background: 'rgba(6, 182, 212, 0.1)', color: 'var(--color-secondary)', border: '1px solid rgba(6, 182, 212, 0.2)' }}>
+                                {t.activityType || 'INTEREST'}
+                              </span>
+                            )}
+                            {t.type === 'TRANSFER' && (
+                              <span className="badge" style={{ background: 'rgba(99, 102, 241, 0.1)', color: 'var(--color-primary)', border: '1px solid rgba(99, 102, 241, 0.2)' }}>
+                                {t.activityType || 'TRANSFER'}
+                              </span>
+                            )}
+                            {t.type === 'DIVIDEND' && (
+                              <span className="badge badge-success">
+                                {t.activityType || 'DIVIDEND'}
+                              </span>
+                            )}
+                          </td>
+                          <td>{['FEE', 'INTEREST', 'TRANSFER', 'DIVIDEND'].includes(t.type) ? '-' : t.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
+                          <td>{['FEE', 'INTEREST', 'TRANSFER', 'DIVIDEND'].includes(t.type) ? '-' : formatCurrency(t.price)}</td>
+                          <td>{['FEE', 'INTEREST', 'TRANSFER', 'DIVIDEND'].includes(t.type) ? '-' : formatCurrency(t.commission || 0)}</td>
+                          <td style={{ fontWeight: '500' }} className={t.amount >= 0 ? 'gain-text' : 'loss-text'}>
+                            {formatCurrency(t.amount)}
+                          </td>
+                          <td style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t.id}</td>
+                          <td>
+                            <button 
+                              className="btn btn-secondary" 
+                              style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
+                              onClick={() => {
+                                setEditingTxnId(t.id);
+                                setEditForm({
+                                  date: t.date,
+                                  voided: !!t.voided
+                                });
+                              }}
+                            >
+                              Edit
+                            </button>
+                          </td>
+                        </tr>
+                        {isEdited && (
+                          <tr style={{ background: 'rgba(255, 255, 255, 0.015)' }}>
+                            <td colSpan={9} style={{ padding: '1rem', borderTop: 'none' }}>
+                              <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                                <div className="form-group" style={{ margin: 0, minWidth: '150px' }}>
+                                  <label className="form-label" style={{ fontSize: '0.725rem', color: 'var(--text-secondary)' }}>Transaction Date</label>
+                                  <input 
+                                    type="date" 
+                                    className="form-input" 
+                                    style={{ padding: '0.4rem 0.5rem', fontSize: '0.8rem' }}
+                                    value={editForm.date}
+                                    onChange={(e) => setEditForm({ ...editForm, date: e.target.value })}
+                                  />
+                                </div>
+                                
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '1.25rem' }}>
+                                  <input 
+                                    type="checkbox" 
+                                    id={`void-checkbox-${t.id}`}
+                                    checked={editForm.voided}
+                                    onChange={(e) => setEditForm({ ...editForm, voided: e.target.checked })}
+                                    style={{ cursor: 'pointer' }}
+                                  />
+                                  <label htmlFor={`void-checkbox-${t.id}`} style={{ fontSize: '0.8rem', color: 'var(--text-primary)', cursor: 'pointer', userSelect: 'none' }}>
+                                    Void this transaction (exclude from all calculations)
+                                  </label>
+                                </div>
+                                
+                                <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto', marginTop: '1.25rem' }}>
+                                  <button 
+                                    className="btn btn-secondary" 
+                                    style={{ padding: '0.4rem 0.75rem', fontSize: '0.8rem' }} 
+                                    onClick={() => setEditingTxnId(null)}
+                                  >
+                                    Cancel
+                                  </button>
+                                  <button 
+                                    className="btn btn-primary" 
+                                    style={{ padding: '0.4rem 0.75rem', fontSize: '0.8rem' }} 
+                                    onClick={() => handleSaveTxnEdit(t.id)}
+                                  >
+                                    Save Changes
+                                  </button>
+                                </div>
+                              </div>
+                              
+                              {/* Visual Note on Imported Date */}
+                              {t.importedDate && (
+                                <div style={{ marginTop: '0.75rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                                  Original Imported Date: <strong>{t.importedDate}</strong>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
